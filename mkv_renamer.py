@@ -1761,6 +1761,44 @@ class MkvRenamerApp(App[None]):
         rows.sort(key=self._sort_key_for_item, reverse=self._sort_desc)
         return rows
 
+    def _table_content_width(self) -> int:
+        """Return the usable table width after accounting for widget chrome."""
+        try:
+            table = self._table()
+            if table.size.width > 0:
+                return max(20, table.size.width + 5)
+        except (NoMatches, AttributeError):
+            pass
+        return max(40, self.size.width - 6)
+
+    def _measure_column_content(
+        self, rows: list[RenamePlanItem], col_idx: int, header: str
+    ) -> int:
+        """Measure the width needed for one column's header and visible cells."""
+        width = len(header)
+        for item in rows:
+            if col_idx == 0:
+                width = max(width, len(item.reason))
+            elif col_idx == 1:
+                width = max(width, len(item.status))
+            elif col_idx == 2:
+                width = max(width, len(item.action))
+            elif col_idx == 3:
+                width = max(width, len(item.target_name))
+            elif col_idx == 4:
+                width = max(width, len(item.original_name))
+            else:
+                width = max(width, len(item.folder_path))
+        return width + 2
+
+    def _rendered_columns_width(self) -> int:
+        """Return the table's current rendered column width without borders."""
+        table = self._table()
+        total = 0
+        for col_key in self._column_keys:
+            total += table.columns[col_key].get_render_width(table)
+        return total
+
     def _apply_column_widths(self, rows: list[RenamePlanItem] | None = None) -> None:
         """Fit table columns to content while honoring manual overrides."""
         table = self._table()
@@ -1769,57 +1807,50 @@ class MkvRenamerApp(App[None]):
         if rows is None:
             rows = self._filtered_sorted_rows()
 
-        available = max(
-            40, table.size.width if table.size.width > 0 else self.size.width - 4
-        )
+        available = self._table_content_width()
         separators = len(self._COLUMN_SPECS) + 1
         usable = max(20, available - separators)
-
-        natural = [
-            len("Reason"),
-            len("Status"),
-            len("Action"),
-            len("Target"),
-            len("Original"),
-            len("Folder"),
-        ]
-        for item in rows:
-            natural[0] = max(natural[0], len(item.reason))
-            natural[1] = max(natural[1], len(item.status))
-            natural[2] = max(natural[2], len(item.action))
-            natural[3] = max(natural[3], len(item.target_name))
-            natural[4] = max(natural[4], len(item.original_name))
-            natural[5] = max(natural[5], len(item.folder_path))
 
         hard_min_widths = [14, 12, 8, 16, 14, 14]
         soft_min_widths = [20, 14, 10, 32, 28, 28]
         max_widths = [60, 18, 14, 90, 80, 80]
+        preferred = [
+            self._measure_column_content(rows, idx, header)
+            for idx, (header, _key, _ratio, _min_width) in enumerate(self._COLUMN_SPECS)
+        ]
         widths = [
             max(
                 soft_min_widths[i],
-                min(max_widths[i], natural[i] + 2),
+                min(max_widths[i], preferred[i]),
             )
-            for i in range(len(natural))
+            for i in range(len(preferred))
         ]
 
         for idx, fixed_width in self._fixed_col_widths.items():
             if idx in range(len(widths)):
-                widths[idx] = max(8, fixed_width)
+                widths[idx] = max(
+                    hard_min_widths[idx], min(max_widths[idx], fixed_width)
+                )
 
         total = sum(widths)
 
-        shrink_order = [5, 4, 3, 2, 1]
+        shrink_order = [5, 4, 3, 2, 1, 0]
         while total > usable:
+            overflow = total - usable
             changed = False
             for idx in shrink_order:
                 if idx in self._user_fixed_cols:
                     continue
-                if widths[idx] > hard_min_widths[idx]:
-                    widths[idx] -= 1
-                    total -= 1
-                    changed = True
-                    if total <= usable:
-                        break
+                shrink_cap = widths[idx] - hard_min_widths[idx]
+                if shrink_cap <= 0:
+                    continue
+                reduction = min(shrink_cap, overflow)
+                widths[idx] -= reduction
+                total -= reduction
+                overflow -= reduction
+                changed = True
+                if overflow <= 0:
+                    break
             if not changed:
                 break
 
@@ -1829,6 +1860,33 @@ class MkvRenamerApp(App[None]):
             col.auto_width = False
             col.width = width
             col.content_width = width
+
+        rendered_total = self._rendered_columns_width() + separators
+        while rendered_total > available:
+            overflow = rendered_total - available
+            changed = False
+            for idx in shrink_order:
+                if idx in self._user_fixed_cols:
+                    continue
+                shrink_cap = widths[idx] - hard_min_widths[idx]
+                if shrink_cap <= 0:
+                    continue
+                reduction = min(shrink_cap, overflow)
+                if reduction <= 0:
+                    continue
+                widths[idx] -= reduction
+                col = table.columns[self._column_keys[idx]]
+                col.width = widths[idx]
+                col.content_width = widths[idx]
+                changed = True
+                rendered_total -= reduction
+                overflow -= reduction
+                if overflow <= 0:
+                    break
+            if not changed:
+                break
+
+        self._col_widths = list(widths)
         table.refresh(layout=True, repaint=True)
 
     def _selected_col_index(self) -> int:
@@ -1853,7 +1911,7 @@ class MkvRenamerApp(App[None]):
         col = table.columns[col_key]
         col.auto_width = False
         col.width = clamped_width
-        col.content_width = max(col.content_width, clamped_width)
+        col.content_width = clamped_width
 
         self._refresh_table()
 
