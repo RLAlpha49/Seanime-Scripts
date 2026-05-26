@@ -74,6 +74,8 @@ PlanStatus = Literal[
 ]
 PlanAction = Literal["Movie", "Skip", "Format", "Renumber"]
 
+_APPLYABLE_STATUSES = {"Pending", "WouldRename"}
+
 EPISODE_PATTERNS = {
     "SeasonEpisode": re.compile(
         r"\bS(?P<Season>\d{1,2})E(?P<Episode>\d{1,3}(?:\.\d+)?)(?:v\d+)?\b", re.I
@@ -618,6 +620,31 @@ def new_rename_plan_item(
     )
 
 
+def describe_plan_reason(
+    file_record: FileRecord, target_token: str, action: PlanAction
+) -> str:
+    """Return a human-readable explanation for a planned rename."""
+    if action == "Movie":
+        return "Rename movie to match the folder title."
+
+    if not file_record.episode_info:
+        return "Rename to match the expected series format."
+
+    original_token = file_record.episode_info.token
+    if action == "Renumber" and target_token and target_token != original_token:
+        return f"Renumber in folder order: {original_token} -> {target_token}."
+    if target_token and target_token != original_token:
+        return f"Normalize episode token: {original_token} -> {target_token}."
+    if target_token:
+        return f"Format filename using episode token {target_token}."
+    return "Rename to match the expected series format."
+
+
+def is_applyable_item(item: RenamePlanItem) -> bool:
+    """Return whether a plan row should be applied during the rename pass."""
+    return item.status in _APPLYABLE_STATUSES and item.will_rename
+
+
 def get_plan_counts(plan_items: Iterable[RenamePlanItem]) -> dict[str, int]:
     """Summarize plan items into changed, skipped, and failed counts."""
     items = list(plan_items)
@@ -694,7 +721,7 @@ def new_folder_plan(
                 "Movie",
                 False,
                 "Pending",
-                "Single-file folder uses folder title.",
+                describe_plan_reason(single_file, "", "Movie"),
             )
         )
     elif parsed_count == 0:
@@ -752,7 +779,7 @@ def new_folder_plan(
                     action,
                     renumber_enabled,
                     "Pending",
-                    "",
+                    describe_plan_reason(file_record, target_token or "", action),
                 )
             )
 
@@ -867,9 +894,7 @@ def invoke_two_phase_rename(plan_items: list[RenamePlanItem]) -> None:
     same batch (for example swapping names). Temp names make the operation
     collision-safe and allow best-effort rollback on failure.
     """
-    pending_changes = [
-        item for item in plan_items if item.status == "Pending" and item.will_rename
-    ]
+    pending_changes = [item for item in plan_items if is_applyable_item(item)]
     if not pending_changes:
         return
 
@@ -888,11 +913,10 @@ def invoke_two_phase_rename(plan_items: list[RenamePlanItem]) -> None:
             assert item.temp_path is not None
             Path(item.temp_path).rename(Path(item.folder_path) / item.target_name)
             item.status = "Renamed"
-            item.reason = ""
     except OSError as exc:
         failure_message = str(exc)
         for item in pending_changes:
-            if item.status == "Pending":
+            if item.status in _APPLYABLE_STATUSES:
                 item.status = "Failed"
                 item.reason = failure_message
 
@@ -929,19 +953,29 @@ def write_plan_item(plan_item: RenamePlanItem) -> None:
             f"[yellow][SKIP][/yellow] {plan_item.original_name} :: {plan_item.reason}"
         )
     elif plan_item.status == "WouldRename":
-        CONSOLE.print(
-            f"[yellow][DRY-RUN][/yellow] {plan_item.original_name} -> {plan_item.target_name}"
+        message = (
+            f"[yellow][DRY-RUN][/yellow] {plan_item.original_name} -> "
+            f"{plan_item.target_name}"
         )
+        if plan_item.reason:
+            message = f"{message} :: {plan_item.reason}"
+        CONSOLE.print(message)
     elif plan_item.status == "Renamed":
-        CONSOLE.print(
+        message = (
             f"[green][OK][/green] {plan_item.original_name} -> {plan_item.target_name}"
         )
+        if plan_item.reason:
+            message = f"{message} :: {plan_item.reason}"
+        CONSOLE.print(message)
     elif plan_item.status == "Failed":
         CONSOLE.print(
             f"[red][ERROR][/red] {plan_item.original_name} :: {plan_item.reason}"
         )
     else:
-        CONSOLE.print(f"[dim]{plan_item.original_name}[/dim]")
+        message = f"[dim]{plan_item.original_name}[/dim]"
+        if plan_item.reason:
+            message = f"{message} :: {plan_item.reason}"
+        CONSOLE.print(message)
 
 
 def write_top_folder_summary(folder_plans: list[FolderPlan]) -> None:
@@ -1757,9 +1791,9 @@ class MkvRenamerApp(App[None]):
             natural[4] = max(natural[4], len(item.original_name))
             natural[5] = max(natural[5], len(item.folder_path))
 
-        hard_min_widths = [14, 10, 8, 16, 14, 14]
-        soft_min_widths = [20, 12, 10, 32, 28, 28]
-        max_widths = [60, 16, 14, 90, 80, 80]
+        hard_min_widths = [14, 12, 8, 16, 14, 14]
+        soft_min_widths = [20, 14, 10, 32, 28, 28]
+        max_widths = [60, 18, 14, 90, 80, 80]
         widths = [
             max(
                 soft_min_widths[i],
@@ -1996,9 +2030,7 @@ class MkvRenamerApp(App[None]):
         folders = [
             folder
             for folder in self._scan_result.folder_plans
-            if any(
-                item.status == "Pending" and item.will_rename for item in folder.items
-            )
+            if any(is_applyable_item(item) for item in folder.items)
         ]
         if not folders:
             self.call_from_thread(self._write_log, "[yellow]Nothing to apply.[/yellow]")
