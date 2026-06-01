@@ -112,6 +112,7 @@ class FormConfig(TypedDict):
     default_subs: str
     auto_default: bool
     fix_missing_default: bool
+    sync_title_to_filename: bool
     protect_single_audio: bool
     protect_single_sub: bool
     dry_run: bool
@@ -142,6 +143,7 @@ class RunConfig(TypedDict):
     default_subs: str | None
     auto_default: bool
     fix_missing_default: bool
+    sync_title_to_filename: bool
     protect_single_audio: bool
     protect_single_sub: bool
     dry_run: bool
@@ -200,6 +202,8 @@ class RunSummary(TypedDict):
     audio_defaults: dict[int, bool]
     sub_defaults: dict[int, bool]
     defaults_changed: bool
+    title_target: str | None
+    title_changed: bool
 
 
 def _empty_track_list() -> list[TrackInfo]:
@@ -397,10 +401,14 @@ def build_mkvpropedit_cmd(
     target: Path,
     tracks: list[TrackInfo],
     summary: RunSummary,
+    title: str | None = None,
 ) -> list[str]:
     """Build mkvpropedit command for default-flag-only updates."""
     selector_by_tid = _track_selector_map(tracks)
     cmd = ["mkvpropedit", str(target)]
+
+    if title is not None:
+        cmd += ["--edit", "info", "--set", f"title={title}"]
 
     for t in summary["audio_keep"]:
         new_default = summary["audio_defaults"].get(t.tid, t.default)
@@ -437,7 +445,7 @@ def build_mkvpropedit_cmd(
     return cmd
 
 
-# ── Core logic (unchanged from original) ─────────────────────────────────────
+# ── Core logic ─────────────────────────────────────
 
 
 def check_dependencies() -> bool:
@@ -491,8 +499,42 @@ def _run_subprocess_with_timeout(
     raise last_error
 
 
-def get_tracks(mkv_path: Path) -> list[TrackInfo]:
-    """Read track info from an MKV file using mkvmerge JSON output."""
+def _extract_title_from_identification(data: Mapping[str, object]) -> str | None:
+    """Best-effort extraction of the Matroska segment title from mkvmerge JSON."""
+    candidate_roots: list[object] = [
+        data.get("container"),
+        data.get("properties"),
+        data.get("segment_info"),
+        data.get("segmentInfo"),
+        data.get("info"),
+    ]
+
+    for root in candidate_roots:
+        if not isinstance(root, Mapping):
+            continue
+
+        root_map = cast(Mapping[str, object], root)
+
+        raw_title = root_map.get("title")
+        if isinstance(raw_title, str):
+            title = raw_title.strip()
+            if title:
+                return title
+
+        raw_props = root_map.get("properties")
+        if isinstance(raw_props, Mapping):
+            props = cast(Mapping[str, object], raw_props)
+            raw_title = props.get("title")
+            if isinstance(raw_title, str):
+                title = raw_title.strip()
+                if title:
+                    return title
+
+    return None
+
+
+def get_tracks_and_title(mkv_path: Path) -> tuple[list[TrackInfo], str | None]:
+    """Read track info and title from an MKV file using mkvmerge JSON output."""
     result = _run_subprocess_with_timeout(
         ["mkvmerge", "-J", str(mkv_path)],
         timeout=_SUBPROCESS_PROBE_TIMEOUT_SECONDS,
@@ -514,6 +556,12 @@ def get_tracks(mkv_path: Path) -> list[TrackInfo]:
                 forced=bool(props.get("forced_track", False)),
             )
         )
+    return tracks, _extract_title_from_identification(cast(Mapping[str, object], data))
+
+
+def get_tracks(mkv_path: Path) -> list[TrackInfo]:
+    """Read track info from an MKV file using mkvmerge JSON output."""
+    tracks, _title = get_tracks_and_title(mkv_path)
     return tracks
 
 
@@ -639,20 +687,18 @@ def split_default(val: str | None) -> tuple[str | None, str | None]:
     return None, val
 
 
+def _desired_output_title(src: Path, dst: Path, in_place: bool) -> str | None:
+    """Return the title that should match the final on-disk filename."""
+    title = (src if in_place else dst).stem.strip()
+    return title or None
+
+
 def build_mkvmerge_cmd(
     src: Path,
     dst: Path,
     tracks: list[TrackInfo],
-    keep_audio_langs: list[str],
-    keep_sub_langs: list[str],
-    no_subs: bool,
-    remove_named: list[str],
-    auto_default: bool,
-    fix_missing_default: bool,
-    default_audio: str | None,
-    default_subs: str | None,
-    protect_single_audio: bool = True,
-    protect_single_sub: bool = True,
+    options: Mapping[str, object],
+    title: str | None = None,
 ) -> tuple[list[str], RunSummary]:
     """Build the mkvmerge command plus a UI/CLI-readable change plan.
 
@@ -660,6 +706,17 @@ def build_mkvmerge_cmd(
     decision set drives the actual command, dry-run output, and run summaries.
     That avoids "preview says X, run did Y" drift.
     """
+    keep_audio_langs = cast(list[str], options.get("keep_audio_langs", []))
+    keep_sub_langs = cast(list[str], options.get("keep_sub_langs", []))
+    no_subs = bool(options.get("no_subs", False))
+    remove_named = cast(list[str], options.get("remove_named", []))
+    auto_default = bool(options.get("auto_default", True))
+    fix_missing_default = bool(options.get("fix_missing_default", True))
+    default_audio = cast(str | None, options.get("default_audio"))
+    default_subs = cast(str | None, options.get("default_subs"))
+    protect_single_audio = bool(options.get("protect_single_audio", True))
+    protect_single_sub = bool(options.get("protect_single_sub", True))
+
     audio_keep: list[TrackInfo] = []
     sub_keep: list[TrackInfo] = []
     video_keep: list[TrackInfo] = []
@@ -745,6 +802,8 @@ def build_mkvmerge_cmd(
             cmd += ["--default-track-flag", f"{t.tid}:{flag}"]
     else:
         cmd += ["--no-subtitles"]
+    if title is not None:
+        cmd += ["--title", title]
     cmd.append(str(src))
 
     audio_flags_changed = any(
@@ -762,6 +821,8 @@ def build_mkvmerge_cmd(
         "audio_defaults": audio_defaults,
         "sub_defaults": sub_defaults,
         "defaults_changed": audio_flags_changed or sub_flags_changed,
+        "title_target": title,
+        "title_changed": title is not None,
     }
     return cmd, summary
 
@@ -951,6 +1012,10 @@ class HelpScreen(ModalScreen[None]):
                            the original default is removed
     • Fix missing:         Set first track as default when no
                            existing default track is found
+
+    METADATA
+        • Sync title to filename: Keep the MKV title aligned with
+                                                            the file name on disk
 
   TRACK PROTECTION
     • Protect single audio: Keep the only audio track even if
@@ -1622,7 +1687,9 @@ class MkvCleanerApp(App[None]):
         self._file_logger = self._build_logger()
         self._save_log_file = False
         self._optional_tools = check_optional_tools()
-        self._track_cache: dict[str, tuple[int, int, list[TrackInfo], int]] = {}
+        self._track_cache: dict[
+            str, tuple[int, int, list[TrackInfo], str | None, int]
+        ] = {}
         self._track_cache_lock = threading.Lock()
         self._track_cache_dirty = False
         self._track_cache_max_entries = 5000
@@ -1755,6 +1822,13 @@ class MkvCleanerApp(App[None]):
                     with Container(classes="switch-row"):
                         yield Label("Assign if none set")
                         yield Switch(id="sw-fix-defaults", value=True)
+
+                with Vertical(classes="control-card"):
+                    yield Label("METADATA", classes="section-title")
+                    yield Label("Sync title to filename", classes="field-label")
+                    with Container(classes="switch-row"):
+                        yield Label("Keep MKV title aligned")
+                        yield Switch(id="sw-sync-title", value=True)
 
                 with Vertical(classes="control-card"):
                     yield Label("SAFETY", classes="section-title")
@@ -1925,6 +1999,7 @@ class MkvCleanerApp(App[None]):
             "no_subs": "sw-no-subs",
             "auto_default": "sw-auto-default",
             "fix_missing_default": "sw-fix-defaults",
+            "sync_title_to_filename": "sw-sync-title",
             "protect_single_audio": "sw-protect-audio",
             "protect_single_sub": "sw-protect-sub",
             "dry_run": "sw-dry-run",
@@ -1986,6 +2061,7 @@ class MkvCleanerApp(App[None]):
             "default_subs": self.query_one("#inp-default-subs", Input).value.strip(),
             "auto_default": self.query_one("#sw-auto-default", Switch).value,
             "fix_missing_default": self.query_one("#sw-fix-defaults", Switch).value,
+            "sync_title_to_filename": self.query_one("#sw-sync-title", Switch).value,
             "protect_single_audio": self.query_one("#sw-protect-audio", Switch).value,
             "protect_single_sub": self.query_one("#sw-protect-sub", Switch).value,
             "dry_run": self.query_one("#sw-dry-run", Switch).value,
@@ -2021,6 +2097,7 @@ class MkvCleanerApp(App[None]):
                 "sw-no-subs": ("no_subs", False),
                 "sw-auto-default": ("auto_default", True),
                 "sw-fix-defaults": ("fix_missing_default", True),
+                "sw-sync-title": ("sync_title_to_filename", True),
                 "sw-protect-audio": ("protect_single_audio", True),
                 "sw-protect-sub": ("protect_single_sub", True),
                 "sw-dry-run": ("dry_run", False),
@@ -2949,6 +3026,7 @@ class MkvCleanerApp(App[None]):
             "default_subs": val("#inp-default-subs"),
             "auto_default": sw("#sw-auto-default"),
             "fix_missing_default": sw("#sw-fix-defaults"),
+            "sync_title_to_filename": sw("#sw-sync-title"),
             "protect_single_audio": sw("#sw-protect-audio"),
             "protect_single_sub": sw("#sw-protect-sub"),
             "dry_run": sw("#sw-dry-run"),
@@ -3023,7 +3101,7 @@ class MkvCleanerApp(App[None]):
             return
 
         now_ts = int(time.time())
-        loaded: dict[str, tuple[int, int, list[TrackInfo], int]] = {}
+        loaded: dict[str, tuple[int, int, list[TrackInfo], str | None, int]] = {}
         entries = cast(dict[object, object], entries_obj)
         modified = False
         for raw_path, entry_obj in entries.items():
@@ -3034,6 +3112,7 @@ class MkvCleanerApp(App[None]):
             entry = cast(dict[object, object], entry_obj)
             raw_mtime = entry.get("mtime_ns")
             raw_size = entry.get("size")
+            raw_title = entry.get("title")
             tracks_obj = entry.get("tracks")
             if not isinstance(raw_mtime, int) or not isinstance(raw_size, int):
                 modified = True
@@ -3041,6 +3120,12 @@ class MkvCleanerApp(App[None]):
             if not isinstance(tracks_obj, list):
                 modified = True
                 continue
+            if isinstance(raw_title, str):
+                title = raw_title.strip() or None
+            else:
+                title = None
+                if raw_title is not None:
+                    modified = True
             raw_last_accessed = entry.get("last_accessed")
             if isinstance(raw_last_accessed, (int, float)):
                 last_accessed = int(raw_last_accessed)
@@ -3065,14 +3150,14 @@ class MkvCleanerApp(App[None]):
                     valid = False
                     break
             if valid:
-                loaded[path_key] = (raw_mtime, raw_size, tracks, last_accessed)
+                loaded[path_key] = (raw_mtime, raw_size, tracks, title, last_accessed)
             else:
                 modified = True
 
         if len(loaded) > self._track_cache_max_entries:
             keep = sorted(
                 loaded.items(),
-                key=lambda item: item[1][3],
+                key=lambda item: item[1][4],
                 reverse=True,
             )[: self._track_cache_max_entries]
             loaded = dict(keep)
@@ -3096,6 +3181,7 @@ class MkvCleanerApp(App[None]):
                 _mtime_ns,
                 _size,
                 _tracks,
+                _title,
                 last_accessed,
             ) in self._track_cache.items()
             if now_ts - last_accessed > self._track_cache_ttl_seconds
@@ -3107,7 +3193,7 @@ class MkvCleanerApp(App[None]):
         if len(self._track_cache) > self._track_cache_max_entries:
             stale_keys = sorted(
                 self._track_cache,
-                key=lambda key: self._track_cache[key][3],
+                key=lambda key: self._track_cache[key][4],
             )[: len(self._track_cache) - self._track_cache_max_entries]
             for key in stale_keys:
                 self._track_cache.pop(key, None)
@@ -3129,15 +3215,16 @@ class MkvCleanerApp(App[None]):
 
             items = sorted(
                 self._track_cache.items(),
-                key=lambda item: item[1][3],
+                key=lambda item: item[1][4],
                 reverse=True,
             )
 
             payload_entries: dict[str, object] = {}
-            for path_key, (mtime_ns, size, tracks, last_accessed) in items:
+            for path_key, (mtime_ns, size, tracks, title, last_accessed) in items:
                 payload_entries[path_key] = {
                     "mtime_ns": mtime_ns,
                     "size": size,
+                    "title": title,
                     "last_accessed": last_accessed,
                     "tracks": [_track_to_payload(track) for track in tracks],
                 }
@@ -3165,41 +3252,41 @@ class MkvCleanerApp(App[None]):
             if removed is not None:
                 self._track_cache_dirty = True
 
-    def _get_tracks_cached(self, mkv_path: Path) -> tuple[list[TrackInfo], int]:
+    def _get_tracks_cached(
+        self, mkv_path: Path
+    ) -> tuple[list[TrackInfo], int, str | None]:
         """Return cached track metadata when file size/mtime is unchanged."""
         stat = mkv_path.stat()
         cache_key = str(mkv_path)
         now_ts = int(time.time())
         with self._track_cache_lock:
             cached = self._track_cache.get(cache_key)
-        if (
-            cached is not None
-            and cached[0] == stat.st_mtime_ns
-            and cached[1] == stat.st_size
-        ):
+        if cached is None or cached[0] != stat.st_mtime_ns or cached[1] != stat.st_size:
+            self._record_cache_lookup(False)
+            tracks, title = get_tracks_and_title(mkv_path)
             with self._track_cache_lock:
-                current = self._track_cache.get(cache_key)
-                if current is not None:
-                    self._track_cache[cache_key] = (
-                        current[0],
-                        current[1],
-                        current[2],
-                        now_ts,
-                    )
-            self._record_cache_lookup(True)
-            return cached[2], stat.st_size
+                self._track_cache[cache_key] = (
+                    stat.st_mtime_ns,
+                    stat.st_size,
+                    tracks,
+                    title,
+                    now_ts,
+                )
+                self._track_cache_dirty = True
+            return tracks, stat.st_size, title
 
-        self._record_cache_lookup(False)
-        tracks = get_tracks(mkv_path)
         with self._track_cache_lock:
-            self._track_cache[cache_key] = (
-                stat.st_mtime_ns,
-                stat.st_size,
-                tracks,
-                now_ts,
-            )
-            self._track_cache_dirty = True
-        return tracks, stat.st_size
+            current = self._track_cache.get(cache_key)
+            if current is not None:
+                self._track_cache[cache_key] = (
+                    current[0],
+                    current[1],
+                    current[2],
+                    current[3],
+                    now_ts,
+                )
+        self._record_cache_lookup(True)
+        return cached[2], stat.st_size, cached[3]
 
     def _source_description(self, cfg: RunConfig) -> str:
         """Describe the active input source for logs and headers."""
@@ -3372,6 +3459,11 @@ class MkvCleanerApp(App[None]):
         else:
             slog.write(Text("    • No default-flag changes", style="dim"))
 
+        if summary["title_changed"]:
+            title_target = summary["title_target"] or "—"
+            slog.write(self._summary_section("  File title".strip()))
+            slog.write(Text(f"    ★ title → {title_target}", style="magenta"))
+
         if after_size is not None and not dry_run:
             saved = before_size - after_size
             slog.write(
@@ -3397,6 +3489,8 @@ class MkvCleanerApp(App[None]):
         audio_removed = sum(1 for t in outcome.result.removed if t[0] == "audio")
         sub_removed = sum(1 for t in outcome.result.removed if t[0] == "subtitle")
         default_flips = len(outcome.result.default_changes)
+        title_changed = outcome.summary["title_changed"]
+        title_target = outcome.summary["title_target"] or "—"
 
         if outcome.state == "error":
             return f"✗ {outcome.path.name}: failed" + (
@@ -3407,14 +3501,14 @@ class MkvCleanerApp(App[None]):
             return (
                 f"✓ {outcome.path.name}: no changes needed"
                 f" (audio rm={audio_removed}, subs rm={sub_removed},"
-                f" defaults={default_flips})"
+                f" defaults={default_flips}, title={'1' if title_changed else '0'})"
             )
 
         if outcome.state == "dry_run" or dry_run:
             return (
                 f"◌ {outcome.path.name}: preview ready"
                 f" (audio rm={audio_removed}, subs rm={sub_removed},"
-                f" defaults={default_flips})"
+                f" defaults={default_flips}, title={title_target if title_changed else '0'})"
             )
 
         if outcome.state == "written":
@@ -3423,12 +3517,12 @@ class MkvCleanerApp(App[None]):
                 return (
                     f"✅ {outcome.path.name}: written"
                     f" (audio rm={audio_removed}, subs rm={sub_removed},"
-                    f" defaults={default_flips}, {fmt_delta(saved, outcome.before_size)})"
+                    f" defaults={default_flips}, title={title_target if title_changed else '0'}, {fmt_delta(saved, outcome.before_size)})"
                 )
             return (
                 f"✅ {outcome.path.name}: written"
                 f" (audio rm={audio_removed}, subs rm={sub_removed},"
-                f" defaults={default_flips})"
+                f" defaults={default_flips}, title={title_target if title_changed else '0'})"
             )
 
         if outcome.state == "cancelled":
@@ -3781,7 +3875,7 @@ class MkvCleanerApp(App[None]):
 
         def _probe(mkv_file: Path) -> tuple[Path, str, list[TrackInfo], str | None]:
             try:
-                tracks, size_bytes = self._get_tracks_cached(mkv_file)
+                tracks, size_bytes, _title = self._get_tracks_cached(mkv_file)
                 return mkv_file, fmt_size(size_bytes), tracks, None
             except (RuntimeError, OSError, TypeError, ValueError) as exc:
                 return mkv_file, "?", [], str(exc)
@@ -3939,10 +4033,12 @@ class MkvCleanerApp(App[None]):
             "audio_defaults": {},
             "sub_defaults": {},
             "defaults_changed": False,
+            "title_target": None,
+            "title_changed": False,
         }
 
         try:
-            tracks, src_size_bytes = self._get_tracks_cached(src)
+            tracks, src_size_bytes, current_title = self._get_tracks_cached(src)
         except (RuntimeError, OSError, TypeError, ValueError) as exc:
             try:
                 before_size = src.stat().st_size
@@ -3964,21 +4060,32 @@ class MkvCleanerApp(App[None]):
         result.src_size = src_size_bytes
         size_str = fmt_size(result.src_size)
         dst = src.with_stem(src.stem + ".cleaned")
+        desired_title = _desired_output_title(src, dst, cfg["in_place"])
+        title_changed = bool(
+            cfg["sync_title_to_filename"]
+            and desired_title is not None
+            and current_title != desired_title
+            and tracks
+        )
+        title_skipped = bool(
+            cfg["sync_title_to_filename"]
+            and desired_title is not None
+            and current_title != desired_title
+            and not tracks
+        )
+        if title_skipped:
+            self.call_from_thread(
+                self._log_event,
+                f"{src.name}: skipping title sync because no tracks were detected",
+                "WARN",
+            )
 
         cmd, summary = build_mkvmerge_cmd(
             src,
             dst,
             tracks,
-            cfg["keep_audio_langs"],
-            cfg["keep_sub_langs"],
-            cfg["no_subs"],
-            cfg["remove_named"],
-            cfg["auto_default"],
-            cfg["fix_missing_default"],
-            cfg["default_audio"],
-            cfg["default_subs"],
-            protect_single_audio=cfg["protect_single_audio"],
-            protect_single_sub=cfg["protect_single_sub"],
+            cfg,
+            title=desired_title if title_changed else None,
         )
 
         nothing_removed = not summary["audio_removed"] and not summary["subs_removed"]
@@ -4011,7 +4118,7 @@ class MkvCleanerApp(App[None]):
             if summary["sub_defaults"].get(t.tid, t.default) != t.default
         ]
 
-        if nothing_removed and not defaults_changed:
+        if nothing_removed and not defaults_changed and not title_changed:
             result.skipped = True
             preview_prefix = "◌ PREVIEW " if cfg["dry_run"] else ""
             return RunWorkerOutcome(
@@ -4047,7 +4154,7 @@ class MkvCleanerApp(App[None]):
                 before_size=result.src_size,
             )
 
-        metadata_only = nothing_removed and defaults_changed
+        metadata_only = nothing_removed and (defaults_changed or title_changed)
         if metadata_only and self._optional_tools.get("mkvpropedit", False):
             self.call_from_thread(
                 self._log_event,
@@ -4075,7 +4182,12 @@ class MkvCleanerApp(App[None]):
                         ],
                     )
 
-            meta_cmd = build_mkvpropedit_cmd(target, tracks, summary)
+            meta_cmd = build_mkvpropedit_cmd(
+                target,
+                tracks,
+                summary,
+                title=desired_title if title_changed else None,
+            )
             if len(meta_cmd) > 2:
                 self.call_from_thread(
                     self._log_event,
@@ -4113,7 +4225,9 @@ class MkvCleanerApp(App[None]):
                 self._invalidate_track_cache(target)
                 self._invalidate_track_cache(final_path)
                 try:
-                    final_tracks, final_size_bytes = self._get_tracks_cached(final_path)
+                    final_tracks, final_size_bytes, _final_title = (
+                        self._get_tracks_cached(final_path)
+                    )
                     final_size = fmt_size(final_size_bytes)
                 except (RuntimeError, OSError, TypeError, ValueError):
                     final_tracks = tracks
@@ -4165,7 +4279,9 @@ class MkvCleanerApp(App[None]):
 
         self._invalidate_track_cache(final_path)
         try:
-            final_tracks, final_size_bytes = self._get_tracks_cached(final_path)
+            final_tracks, final_size_bytes, _final_title = self._get_tracks_cached(
+                final_path
+            )
             final_size = fmt_size(final_size_bytes)
         except (RuntimeError, OSError, TypeError, ValueError):
             final_tracks = tracks
@@ -4567,24 +4683,13 @@ def _print_tracks_cli(
 
 def _process_file_cli(
     src: Path,
-    keep_audio_langs: list[str],
-    keep_sub_langs: list[str],
-    no_subs: bool,
-    remove_named: list[str],
-    auto_default: bool,
-    fix_missing_default: bool,
-    default_audio: str | None,
-    default_subs: str | None,
-    protect_single_audio: bool,
-    protect_single_sub: bool,
-    dry_run: bool,
-    in_place: bool,
+    options: Mapping[str, object],
 ) -> FileSummary:
     """Process one MKV file in non-TUI mode and print progress to stdout."""
     result = FileSummary(path=src)
 
     try:
-        tracks = get_tracks(src)
+        tracks, current_title = get_tracks_and_title(src)
     except (RuntimeError, OSError, TypeError, ValueError) as exc:
         print(f"[SKIP] {src.name} — could not read tracks: {exc}\n")
         result.errored = True
@@ -4593,27 +4698,34 @@ def _process_file_cli(
     result.src_size = src.stat().st_size
     _print_tracks_cli(tracks, src, file_size=result.src_size)
 
+    sync_title_to_filename = bool(options.get("sync_title_to_filename", True))
+    dry_run = bool(options.get("dry_run", False))
+    in_place = bool(options.get("in_place", False))
+
     dst = src.with_stem(src.stem + ".cleaned")
+    desired_title = _desired_output_title(src, dst, in_place)
+    title_changed = bool(
+        sync_title_to_filename
+        and desired_title is not None
+        and current_title != desired_title
+        and tracks
+    )
+    title_skipped = bool(
+        sync_title_to_filename
+        and desired_title is not None
+        and current_title != desired_title
+        and not tracks
+    )
     cmd, summary = build_mkvmerge_cmd(
-        src,
-        dst,
-        tracks,
-        keep_audio_langs,
-        keep_sub_langs,
-        no_subs,
-        remove_named,
-        auto_default,
-        fix_missing_default,
-        default_audio,
-        default_subs,
-        protect_single_audio=protect_single_audio,
-        protect_single_sub=protect_single_sub,
+        src, dst, tracks, options, title=desired_title if title_changed else None
     )
 
     nothing_removed = not summary["audio_removed"] and not summary["subs_removed"]
     defaults_changed = summary["defaults_changed"]
 
-    if nothing_removed and not defaults_changed:
+    if nothing_removed and not defaults_changed and not title_changed:
+        if title_skipped:
+            print("  ⚠  Skipping title sync because no tracks were detected.")
         print("  ✓  Nothing to do — file already matches criteria. Skipping.\n")
         result.skipped = True
         return result
@@ -4640,6 +4752,9 @@ def _process_file_cli(
                 f"  ★  Set default subtitle : Track {t.tid}  lang={t.lang}  name={t.name or '—'}"
             )
 
+    if title_changed:
+        print(f"  ★  Set title          : {desired_title}")
+
     result.removed = [
         ("audio", t.tid, t.lang, t.name) for t in summary["audio_removed"]
     ] + [("subtitle", t.tid, t.lang, t.name) for t in summary["subs_removed"]]
@@ -4648,7 +4763,7 @@ def _process_file_cli(
         print(f"\n  [DRY RUN] Would write → {dst.name}\n")
         return result
 
-    metadata_only = nothing_removed and defaults_changed
+    metadata_only = nothing_removed and (defaults_changed or title_changed)
     optional_tools = check_optional_tools()
     if metadata_only and optional_tools.get("mkvpropedit", False):
         target = src if in_place else dst
@@ -4662,7 +4777,12 @@ def _process_file_cli(
                 result.errored = True
                 return result
 
-        cmd = build_mkvpropedit_cmd(target, tracks, summary)
+        cmd = build_mkvpropedit_cmd(
+            target,
+            tracks,
+            summary,
+            title=desired_title if title_changed else None,
+        )
         if len(cmd) > 2:
             print(f"\n  ⚡ Metadata-only update → {target.name} ...")
             try:
@@ -4876,6 +4996,12 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     _add_bool_toggle(
         parser,
+        "sync_title_to_filename",
+        "Sync the file title to the filename.",
+        "Do not sync the file title to the filename.",
+    )
+    _add_bool_toggle(
+        parser,
         "protect_single_audio",
         "Keep a file's sole audio track even if filters would remove it.",
         "Allow removing a file's sole audio track.",
@@ -4921,6 +5047,7 @@ def _run_cli_mode(args: argparse.Namespace) -> int:
     no_subs = _bool_with_default(args.no_subs, False)
     auto_default = _bool_with_default(args.auto_default, True)
     fix_missing_default = _bool_with_default(args.fix_missing_default, True)
+    sync_title_to_filename = _bool_with_default(args.sync_title_to_filename, True)
     protect_single_audio = _bool_with_default(args.protect_single_audio, True)
     protect_single_sub = _bool_with_default(args.protect_single_sub, True)
     jobs = resolve_jobs(args.jobs, fallback=default_jobs())
@@ -4975,6 +5102,7 @@ def _run_cli_mode(args: argparse.Namespace) -> int:
             args.default_audio,
             args.default_subs,
             fix_missing_default,
+            sync_title_to_filename,
         ]
     ):
         print("[ERROR] Nothing to do — specify at least one actionable option:")
@@ -4988,20 +5116,24 @@ def _run_cli_mode(args: argparse.Namespace) -> int:
 
     results: list[FileSummary] = []
     for file_path in files:
+        file_options: dict[str, object] = {
+            "keep_audio_langs": args.keep_audio or [],
+            "keep_sub_langs": args.keep_subs or [],
+            "no_subs": no_subs,
+            "remove_named": args.remove_named or [],
+            "auto_default": auto_default,
+            "fix_missing_default": fix_missing_default,
+            "default_audio": args.default_audio,
+            "default_subs": args.default_subs,
+            "sync_title_to_filename": sync_title_to_filename,
+            "protect_single_audio": protect_single_audio,
+            "protect_single_sub": protect_single_sub,
+            "dry_run": dry_run,
+            "in_place": in_place,
+        }
         result = _process_file_cli(
             src=file_path,
-            keep_audio_langs=args.keep_audio or [],
-            keep_sub_langs=args.keep_subs or [],
-            no_subs=no_subs,
-            remove_named=args.remove_named or [],
-            auto_default=auto_default,
-            fix_missing_default=fix_missing_default,
-            default_audio=args.default_audio,
-            default_subs=args.default_subs,
-            protect_single_audio=protect_single_audio,
-            protect_single_sub=protect_single_sub,
-            dry_run=dry_run,
-            in_place=in_place,
+            options=file_options,
         )
         results.append(result)
 
@@ -5030,6 +5162,7 @@ def main() -> None:
         "no_subs",
         "auto_default",
         "fix_missing_default",
+        "sync_title_to_filename",
         "protect_single_audio",
         "protect_single_sub",
         "dry_run",

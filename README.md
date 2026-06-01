@@ -32,6 +32,7 @@ It supports:
 - Interactive TUI mode (default)
 - Non-interactive CLI mode (`--cli`)
 - Dry-run and inspect-first workflows before writing files
+- Optional syncing of the MKV segment title to the file name
 
 ### Common `mkv_cleaner.py` uses
 
