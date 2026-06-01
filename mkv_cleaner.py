@@ -474,6 +474,8 @@ def _run_subprocess_with_timeout(
                 cmd,
                 capture_output=True,
                 text=True,
+                encoding="utf-8",
+                errors="replace",
                 check=False,
                 timeout=timeout,
             )
@@ -3740,7 +3742,12 @@ class MkvCleanerApp(App[None]):
         """Run a subprocess that can be cancelled via self._cancel_event."""
         self._log_event(f"Launching subprocess: {' '.join(cmd)}", "DEBUG", False)
         proc = subprocess.Popen(
-            cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True
+            cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
         )
         with self._active_process_lock:
             self._active_processes.add(proc)
