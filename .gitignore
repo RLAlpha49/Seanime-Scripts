@@ -1,4 +1,5 @@
 __pycache__
-.mkv*.json
+*.json
 AGENTS.md
+run.bat
 TODO.md
