@@ -481,9 +481,14 @@ def build_info_panel(
     )
 
 
-def build_panel_grid(panels: list[Panel], columns: int) -> Table:
+def build_panel_grid(
+    panels: list[Panel],
+    columns: int,
+    *,
+    padding: tuple[int, int] = (0, 0),
+) -> Table:
     """Lay out panels in a stable fixed-column grid."""
-    grid = Table.grid(expand=True)
+    grid = Table.grid(expand=True, padding=padding)
     for _ in range(columns):
         grid.add_column(ratio=1)
 
@@ -579,6 +584,67 @@ def build_operation_progress() -> Progress:
         transient=False,
         expand=True,
     )
+
+
+def build_current_action_panel(
+    action: SyncAction | None,
+    *,
+    title: str,
+    note: str,
+    active_jobs: int = 0,
+) -> Panel:
+    """Build the current-action panel shown during apply."""
+    if action is None:
+        body = Table.grid(expand=True, padding=(0, 1))
+        body.add_column(style="white")
+        body.add_row(note)
+        if active_jobs > 0:
+            body.add_row(f"Active jobs: {format_count(active_jobs)}")
+        return Panel(
+            body,
+            title=title,
+            border_style="bright_blue",
+            box=box.DOUBLE,
+            padding=(0, 1),
+        )
+
+    body = Table.grid(expand=True, padding=(0, 1))
+    body.add_column(style="bold cyan", no_wrap=True)
+    body.add_column(style="white", ratio=1)
+    body.add_row("Action", str(action_badge(action.kind)))
+    body.add_row("Path", action.relative_path)
+    body.add_row("Details", note)
+    if action.reason:
+        body.add_row("Reason", action.reason)
+    if active_jobs > 0:
+        body.add_row("Active jobs", format_count(active_jobs))
+    if action.size:
+        body.add_row("Size", format_bytes(action.size))
+
+    return Panel(
+        body,
+        title=title,
+        border_style="bright_blue",
+        box=box.DOUBLE,
+        padding=(0, 1),
+    )
+
+
+def build_job_action_panels(
+    slot_actions: list[SyncAction | None],
+    slot_notes: list[str],
+) -> list[Panel]:
+    """Build one live panel per worker slot during parallel copy."""
+    panels: list[Panel] = []
+    for slot_index, action in enumerate(slot_actions, start=1):
+        panels.append(
+            build_current_action_panel(
+                action,
+                title=f"[bold white]Job {slot_index}[/bold white]",
+                note=slot_notes[slot_index - 1],
+            )
+        )
+    return panels
 
 
 def build_compare_progress() -> Progress:
@@ -1525,9 +1591,9 @@ def apply_plan(
 ) -> None:
     """Apply planned actions in a conflict-safe order.
 
-    Shows a progress bar above N live-updating status lines (one per concurrent
-    job slot). Each status line is updated *before* an action executes and cleared
-    afterward, showing what is *currently* being processed, not a history log.
+    Shows a progress bar above live action panels. Serial phases use one focused
+    panel; the parallel copy phase expands to one panel per worker slot so the
+    apply UI accurately reflects multi-job runs.
     """
     remove_file_actions = sorted(
         [
@@ -1569,7 +1635,6 @@ def apply_plan(
         *copy_file_actions,
     ]
 
-    slot_count = max(1, jobs)
     progress = build_operation_progress()
     task_id = progress.add_task(
         "Applying sync",
@@ -1578,33 +1643,48 @@ def apply_plan(
         details="",
     )
 
-    # Pre-allocate status rows with visible placeholder text so Rich renders
-    # them with proper height from the start.
-    idle_text = " " * 50
-    status_lines: list[Text] = [
-        Text(f"> {idle_text}", style="dim") for _ in range(slot_count)
-    ]
+    active_jobs = 0
+    current_panel = build_current_action_panel(
+        None,
+        title="[bold white]Current Action[/bold white]",
+        note="Waiting for the first planned action.",
+    )
+    renderable = Group(progress, current_panel)
 
-    renderable = Group(progress, *status_lines)
-
-    live = Live(renderable, console=CONSOLE, refresh_per_second=10, transient=True)
+    live = Live(renderable, console=CONSOLE, refresh_per_second=10, transient=False)
     live.start()
 
-    def _set_slot(slot: int, kind: str, relative_path: str) -> None:
-        """Show what a slot is currently working on and refresh the live view."""
-        status_lines[slot].truncate(0)
-        status_lines[slot].append("> ", style="bold cyan")
-        status_lines[slot].append(kind, style=action_style(kind))
-        status_lines[slot].append("   ")
-        status_lines[slot].append(relative_path)
+    def _update_renderable(panels: list[Panel]) -> None:
+        """Refresh the live layout with one or more panels."""
+        nonlocal renderable
+        if len(panels) == 1:
+            renderable = Group(progress, panels[0])
+        else:
+            renderable = Group(
+                progress,
+                build_panel_grid(
+                    panels,
+                    columns=min(2, len(panels)),
+                    padding=(0, 1),
+                ),
+            )
         live.update(renderable)
 
-    def _clear_slot(slot: int) -> None:
-        """Reset a slot to an idle placeholder and refresh the live view."""
-        status_lines[slot].truncate(0)
-        status_lines[slot].append("> ", style="dim")
-        status_lines[slot].append("idle", style="dim")
-        live.update(renderable)
+    def _set_current_action(
+        action: SyncAction | None,
+        *,
+        note: str,
+        active_count: int,
+    ) -> None:
+        """Update the single current-action panel and refresh the live view."""
+        nonlocal current_panel
+        current_panel = build_current_action_panel(
+            action,
+            title="[bold white]Current Action[/bold white]",
+            note=note,
+            active_jobs=active_count,
+        )
+        _update_renderable([current_panel])
 
     def _copy_interrupt_callback(_: int) -> None:
         """Poll for cancellation between copied chunks."""
@@ -1614,22 +1694,19 @@ def apply_plan(
         check_interrupt()
         _validate_source_read_only(source_root, target_root, action)
         assert action.target is not None
-        _set_slot(0, action.kind, action.relative_path)
+        _set_current_action(action, note="Removing file…", active_count=1)
         try:
             action.target.unlink(missing_ok=True)
         except OSError as exc:
-            raise SyncError(
-                f"Failed to remove file: {action.target} :: {exc}"
-            ) from exc
+            raise SyncError(f"Failed to remove file: {action.target} :: {exc}") from exc
         drop_cache_for_path(cache_entries, action.relative_path)
         progress.advance(task_id)
-        _clear_slot(0)
 
     for action in remove_dir_actions:
         check_interrupt()
         _validate_source_read_only(source_root, target_root, action)
         assert action.target is not None
-        _set_slot(0, action.kind, action.relative_path)
+        _set_current_action(action, note="Removing directory…", active_count=1)
         if action.target.exists():
             try:
                 shutil.rmtree(action.target)
@@ -1639,13 +1716,12 @@ def apply_plan(
                 ) from exc
         drop_cache_for_prefix(cache_entries, action.relative_path)
         progress.advance(task_id)
-        _clear_slot(0)
 
     for action in add_dir_actions:
         check_interrupt()
         _validate_source_read_only(source_root, target_root, action)
         assert action.target is not None
-        _set_slot(0, action.kind, action.relative_path)
+        _set_current_action(action, note="Creating directory…", active_count=1)
         try:
             action.target.mkdir(parents=True, exist_ok=True)
         except OSError as exc:
@@ -1654,7 +1730,6 @@ def apply_plan(
             ) from exc
         drop_cache_for_path(cache_entries, action.relative_path)
         progress.advance(task_id)
-        _clear_slot(0)
 
     for action in copy_file_actions:
         check_interrupt()
@@ -1664,18 +1739,31 @@ def apply_plan(
         with ThreadPoolExecutor(max_workers=jobs) as executor:
             future_to_work: dict[Any, tuple[SyncAction, int]] = {}
             pending_actions = iter(copy_file_actions)
+            slot_count = min(jobs, len(copy_file_actions))
+            slot_actions: list[SyncAction | None] = [None] * slot_count
+            slot_notes: list[str] = ["Waiting for work." for _ in range(slot_count)]
+
+            def _render_job_panels() -> None:
+                """Render the current per-job panel grid."""
+                _update_renderable(build_job_action_panels(slot_actions, slot_notes))
 
             def _submit_next(slot: int) -> bool:
                 """Submit the next copy action for one slot, if any remain."""
+                nonlocal active_jobs
                 try:
                     next_action = next(pending_actions)
                 except StopIteration:
-                    _clear_slot(slot)
+                    slot_actions[slot] = None
+                    slot_notes[slot] = "Completed — no more files assigned."
+                    _render_job_panels()
                     return False
 
                 check_interrupt()
                 _validate_source_read_only(source_root, target_root, next_action)
-                _set_slot(slot, next_action.kind, next_action.relative_path)
+                active_jobs += 1
+                slot_actions[slot] = next_action
+                slot_notes[slot] = "Copying file…"
+                _render_job_panels()
                 future = executor.submit(
                     _copy_single_file,
                     next_action,
@@ -1687,7 +1775,8 @@ def apply_plan(
                 future_to_work[future] = (next_action, slot)
                 return True
 
-            for slot in range(min(jobs, len(copy_file_actions))):
+            _render_job_panels()
+            for slot in range(slot_count):
                 _submit_next(slot)
 
             while future_to_work:
@@ -1707,8 +1796,14 @@ def apply_plan(
                     cast(Path, action.target), action.relative_path
                 )
                 cache_entries[action.relative_path] = build_cache_record(
-                    source_entry, target_entry, algorithm,
+                    source_entry,
+                    target_entry,
+                    algorithm,
                 )
+                active_jobs = max(0, active_jobs - 1)
+                slot_actions[slot] = None
+                slot_notes[slot] = "Completed copy."
+                _render_job_panels()
                 progress.advance(task_id)
                 _submit_next(slot)
     else:
@@ -1717,7 +1812,7 @@ def apply_plan(
             _validate_source_read_only(source_root, target_root, action)
             assert action.source is not None
             assert action.target is not None
-            _set_slot(0, action.kind, action.relative_path)
+            _set_current_action(action, note="Copying file…", active_count=1)
 
             copy_file_atomic(
                 action.source,
@@ -1728,12 +1823,8 @@ def apply_plan(
                 progress_callback=_copy_interrupt_callback,
             )
 
-            source_entry = file_entry_from_disk(
-                action.source, action.relative_path
-            )
-            target_entry = file_entry_from_disk(
-                action.target, action.relative_path
-            )
+            source_entry = file_entry_from_disk(action.source, action.relative_path)
+            target_entry = file_entry_from_disk(action.target, action.relative_path)
             cache_entries[action.relative_path] = build_cache_record(
                 source_entry,
                 target_entry,
@@ -1741,9 +1832,14 @@ def apply_plan(
             )
 
             progress.advance(task_id)
-            _clear_slot(0)
 
     progress.update(task_id, description="Applied sync")
+    if not use_parallel_copy:
+        _set_current_action(
+            None,
+            note="All planned sync actions completed.",
+            active_count=0,
+        )
     live.stop()
 
 
