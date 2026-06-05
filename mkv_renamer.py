@@ -31,14 +31,30 @@ import hashlib
 import json
 import os
 import re
+import sys
 import time
-from collections import defaultdict
+from collections import Counter, defaultdict
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable, Iterable, Literal, cast
 
-from rich.console import Console
+from rich import box
+from rich.console import Console, Group, RenderableType
+from rich.live import Live
+from rich.panel import Panel
+from rich.progress import (
+    BarColumn,
+    MofNCompleteColumn,
+    Progress,
+    SpinnerColumn,
+    TaskProgressColumn,
+    TextColumn,
+    TimeElapsedColumn,
+    TimeRemainingColumn,
+)
+from rich.prompt import Confirm
 from rich.table import Table
+from rich.text import Text
 from textual import work
 from textual.app import App, ComposeResult
 from textual.binding import Binding
@@ -63,6 +79,21 @@ from textual.widgets import (
 
 VIDEO_EXTENSIONS_DEFAULT = ("*.mkv", "*.mp4", "*.avi")
 CONSOLE = Console()
+
+_CLI_STATUS_STYLES = {
+    "Pending": "bold bright_cyan",
+    "WouldRename": "bold yellow",
+    "Renamed": "bold green",
+    "Failed": "bold red",
+    "Skipped": "bold yellow",
+    "Unchanged": "dim",
+}
+_CLI_ACTION_STYLES = {
+    "Movie": "bright_magenta",
+    "Skip": "yellow",
+    "Format": "cyan",
+    "Renumber": "green",
+}
 
 _SCAN_CACHE_MAX_ENTRIES = 1000
 _SCAN_CACHE_TTL_SECONDS = 14 * 24 * 60 * 60
@@ -933,126 +964,386 @@ def invoke_two_phase_rename(plan_items: list[RenamePlanItem]) -> None:
                     item.reason = f"Rollback failed: {rollback_exc}"
 
 
-def write_folder_summary(folder_plan: FolderPlan) -> None:
-    """Print one CLI summary line for a folder plan."""
-    counts = get_plan_counts(folder_plan.items)
-    CONSOLE.print(
-        (
-            f"[bold magenta][{folder_plan.status}][/bold magenta] "
-            f"{folder_plan.series_name} | changed: {counts['Changed']}, "
-            f"renumbered: {counts['Renumbered']}, "
-            f"unchanged: {counts['Unchanged']}, skipped: {counts['Skipped']}"
-        )
+def _cli_bool_label(flag: bool) -> str:
+    """Return a colored yes/no label for CLI summary panels."""
+    return "[green]Yes[/green]" if flag else "[red]No[/red]"
+
+
+def _cli_info_panel(
+    title: str, rows: list[tuple[str, str]], border_style: str
+) -> Panel:
+    """Build a small key/value panel for CLI headers and summaries."""
+    grid = Table.grid(expand=True, padding=(0, 1))
+    grid.add_column(style="bold white", no_wrap=True)
+    grid.add_column(style="white", ratio=1)
+    for label, value in rows:
+        grid.add_row(f"{label}", value)
+    return Panel(
+        grid,
+        title=title,
+        border_style=border_style,
+        box=box.ROUNDED,
+        padding=(0, 1),
     )
 
 
-def write_plan_item(plan_item: RenamePlanItem) -> None:
-    """Print one CLI detail row with status-specific color semantics."""
-    if plan_item.status == "Skipped":
-        CONSOLE.print(
-            f"[yellow][SKIP][/yellow] {plan_item.original_name} :: {plan_item.reason}"
+def _cli_metric_panel(
+    title: str,
+    value: str,
+    border_style: str,
+    subtitle: str = "",
+) -> Panel:
+    """Build a compact metric panel for CLI summary totals."""
+    body = Text(justify="center")
+    body.append(f"{value}\n", style=f"bold {border_style}")
+    if subtitle:
+        body.append(subtitle, style="dim")
+    return Panel(
+        body,
+        title=title,
+        border_style=border_style,
+        box=box.ROUNDED,
+        padding=(0, 1),
+    )
+
+
+def _cli_build_notice_panel(
+    message: str,
+    border_style: str,
+    *,
+    title: str | None = None,
+) -> Panel:
+    """Build a compact notice panel for live CLI updates."""
+    return Panel(
+        message,
+        title=title,
+        border_style=border_style,
+        box=box.ROUNDED,
+        padding=(0, 1),
+    )
+
+
+def _cli_build_operation_progress() -> Progress:
+    """Build a cleaner-style counted progress display for renamer CLI runs."""
+    return Progress(
+        SpinnerColumn(style="bold cyan", finished_text="✓"),
+        TextColumn("[bold cyan]{task.description}"),
+        BarColumn(
+            bar_width=None,
+            complete_style="bright_magenta",
+            finished_style="magenta",
+        ),
+        TaskProgressColumn(),
+        MofNCompleteColumn(),
+        TextColumn("{task.fields[details]}", style="white"),
+        TimeElapsedColumn(),
+        TimeRemainingColumn(),
+        console=CONSOLE,
+        transient=False,
+        expand=True,
+    )
+
+
+def _effective_plan_status(plan_item: RenamePlanItem, dry_run: bool) -> PlanStatus:
+    """Return the display status without mutating the underlying plan item."""
+    if dry_run and plan_item.status == "Pending" and plan_item.will_rename:
+        return "WouldRename"
+    return plan_item.status
+
+
+def _cli_display_counts(folder_plan: FolderPlan, dry_run: bool) -> dict[str, int]:
+    """Return folder counts using display statuses for the current phase."""
+    status_counts = Counter(
+        _effective_plan_status(item, dry_run) for item in folder_plan.items
+    )
+    plan_counts = get_plan_counts(folder_plan.items)
+    return {
+        "Files": len(folder_plan.items),
+        "Changed": plan_counts["Changed"],
+        "Renumbered": plan_counts["Renumbered"],
+        "Unchanged": plan_counts["Unchanged"],
+        "Skipped": status_counts["Skipped"],
+        "Failed": status_counts["Failed"],
+    }
+
+
+def _cli_status_badge(status: PlanStatus) -> Text:
+    """Return a styled status badge for one plan row."""
+    label_map = {
+        "WouldRename": "DRY-RUN",
+        "Renamed": "DONE",
+        "Failed": "ERROR",
+        "Skipped": "SKIP",
+        "Unchanged": "UNCHANGED",
+        "Pending": "PENDING",
+    }
+    label = label_map.get(status, status.upper())
+    return Text(f" {label} ", style=_CLI_STATUS_STYLES.get(status, "white"))
+
+
+def _cli_action_badge(action: PlanAction) -> Text:
+    """Return a styled action badge for one plan row."""
+    return Text(f" {action.upper()} ", style=_CLI_ACTION_STYLES.get(action, "white"))
+
+
+def _cli_build_folder_metrics(folder_plan: FolderPlan, dry_run: bool) -> Table:
+    """Build compact folder metrics for the live current-folder panel."""
+    counts = _cli_display_counts(folder_plan, dry_run)
+    grid = Table.grid(expand=True)
+    for _ in range(3):
+        grid.add_column(ratio=1)
+    grid.add_row(
+        _cli_metric_panel("Files", str(counts["Files"]), "bright_blue"),
+        _cli_metric_panel("Changed", str(counts["Changed"]), "bright_green"),
+        _cli_metric_panel("Renumbered", str(counts["Renumbered"]), "green"),
+    )
+    grid.add_row(
+        _cli_metric_panel("Unchanged", str(counts["Unchanged"]), "bright_black"),
+        _cli_metric_panel("Skipped", str(counts["Skipped"]), "yellow"),
+        _cli_metric_panel("Failed", str(counts["Failed"]), "red"),
+    )
+    return grid
+
+
+def _cli_build_folder_items_table(folder_plan: FolderPlan, dry_run: bool) -> Table:
+    """Build the per-file table for one folder in the live CLI view."""
+    table = Table(box=box.HEAVY_HEAD, show_lines=True, expand=True)
+    table.add_column("Status", no_wrap=True)
+    table.add_column("Action", no_wrap=True)
+    table.add_column("Original", overflow="fold")
+    table.add_column("Target", overflow="fold")
+    table.add_column("Reason", overflow="fold")
+
+    for item in folder_plan.items:
+        display_status = _effective_plan_status(item, dry_run)
+        table.add_row(
+            _cli_status_badge(display_status),
+            _cli_action_badge(item.action),
+            item.original_name,
+            item.target_name if item.will_rename else "—",
+            item.reason or "—",
         )
-    elif plan_item.status == "WouldRename":
-        message = (
-            f"[yellow][DRY-RUN][/yellow] {plan_item.original_name} -> "
-            f"{plan_item.target_name}"
-        )
-        if plan_item.reason:
-            message = f"{message} :: {plan_item.reason}"
-        CONSOLE.print(message)
-    elif plan_item.status == "Renamed":
-        message = (
-            f"[green][OK][/green] {plan_item.original_name} -> {plan_item.target_name}"
-        )
-        if plan_item.reason:
-            message = f"{message} :: {plan_item.reason}"
-        CONSOLE.print(message)
-    elif plan_item.status == "Failed":
-        CONSOLE.print(
-            f"[red][ERROR][/red] {plan_item.original_name} :: {plan_item.reason}"
-        )
+    return table
+
+
+def _cli_build_current_folder_panel(
+    *,
+    phase_label: str,
+    folder_index: int,
+    total_folders: int,
+    folder_plan: FolderPlan | None,
+    dry_run: bool,
+) -> Panel:
+    """Build the single current-folder live panel for CLI scan/apply runs."""
+    header = Text(style="dim")
+    if folder_plan is None:
+        header.append(f"{phase_label} 0/{total_folders} • waiting for first folder")
+        body: list[RenderableType] = [
+            header,
+            _cli_build_notice_panel(
+                "[dim]No folder details available yet.[/dim]",
+                "bright_black",
+            ),
+        ]
     else:
-        message = f"[dim]{plan_item.original_name}[/dim]"
-        if plan_item.reason:
-            message = f"{message} :: {plan_item.reason}"
-        CONSOLE.print(message)
-
-
-def write_top_folder_summary(folder_plans: list[FolderPlan]) -> None:
-    """Print the busiest folders in the CLI summary output.
-
-    The summary is intentionally capped to keep large-library output readable
-    while still surfacing where most rename activity happened.
-    """
-    rows: list[tuple[str, dict[str, int]]] = []
-    for folder_plan in folder_plans:
-        rows.append((folder_plan.series_name, get_plan_counts(folder_plan.items)))
-
-    top_rows = [row for row in rows if row[1]["Changed"] > 0 or row[1]["Skipped"] > 0]
-    top_rows.sort(
-        key=lambda row: (row[1]["Changed"], row[1]["Renumbered"]), reverse=True
-    )
-    top_rows = top_rows[:10]
-    if not top_rows:
-        return
-
-    CONSOLE.print("\n[bold magenta]Top Folders[/bold magenta]")
-    for folder_name, counts in top_rows:
-        CONSOLE.print(
-            (
-                f"  [gray]{folder_name}[/gray] | changed: {counts['Changed']}, "
-                f"renumbered: {counts['Renumbered']}, "
-                f"unchanged: {counts['Unchanged']}, skipped: {counts['Skipped']}"
+        header.append(f"{phase_label} {folder_index}/{total_folders} • ")
+        header.append(folder_plan.series_name, style="bold white")
+        header.append(f"  ({folder_plan.status})", style="bold magenta")
+        counts = _cli_display_counts(folder_plan, dry_run)
+        body = [header, _cli_build_folder_metrics(folder_plan, dry_run)]
+        if counts["Changed"] == 0 and counts["Skipped"] == 0 and counts["Failed"] == 0:
+            body.append(
+                _cli_build_notice_panel(
+                    "[bold green]Everything in this folder already matches the expected naming scheme.[/bold green]",
+                    "green",
+                )
             )
+        else:
+            body.append(_cli_build_folder_items_table(folder_plan, dry_run))
+
+    return Panel(
+        Group(*body),
+        title="[bold white]Current Folder[/bold white]",
+        border_style="bright_blue",
+        box=box.DOUBLE,
+        padding=(0, 1),
+    )
+
+
+def _render_cli_runtime_header(
+    media_path: Path,
+    extensions: list[str],
+    recursive: bool,
+    renumber_enabled: bool,
+    dry_run: bool,
+    mode: str,
+    *,
+    folder_count: int,
+    file_count: int,
+) -> None:
+    """Render a run header before the live CLI progress begins."""
+    header_grid = Table.grid(expand=True)
+    header_grid.add_column(ratio=2)
+    header_grid.add_column(ratio=1)
+    header_grid.add_column(ratio=1)
+    header_grid.add_row(
+        _cli_info_panel(
+            "Path",
+            [
+                ("Root", str(media_path)),
+                ("Extensions", ", ".join(extensions or list(VIDEO_EXTENSIONS_DEFAULT))),
+            ],
+            "cyan",
+        ),
+        _cli_info_panel(
+            "Run",
+            [
+                ("Mode", mode.upper()),
+                ("Recursive", _cli_bool_label(recursive)),
+                ("Renumber", _cli_bool_label(renumber_enabled)),
+                ("Dry-run", _cli_bool_label(dry_run)),
+            ],
+            "magenta",
+        ),
+        _cli_info_panel(
+            "Inventory",
+            [
+                ("Folders", str(folder_count)),
+                ("Files", str(file_count)),
+                ("Current", "pending"),
+            ],
+            "green",
+        ),
+    )
+    CONSOLE.print(
+        Panel(
+            header_grid,
+            title="[bold bright_white]Anime File Renamer[/bold bright_white]",
+            border_style="bright_blue",
+            box=box.DOUBLE,
+            padding=(0, 1),
         )
+    )
+
+
+def _render_folder_breakdown(folder_plans: list[FolderPlan]) -> None:
+    """Render a per-folder summary table for the CLI preview."""
+    table = Table(title="Folder Breakdown", box=box.HEAVY_HEAD, show_lines=True)
+    table.add_column("Folder", style="bold white", overflow="fold")
+    table.add_column("Status", style="bold magenta", no_wrap=True)
+    table.add_column("Changed", justify="right", style="cyan")
+    table.add_column("Renumbered", justify="right", style="green")
+    table.add_column("Unchanged", justify="right", style="dim")
+    table.add_column("Skipped", justify="right", style="yellow")
+    for folder_plan in folder_plans:
+        counts = get_plan_counts(folder_plan.items)
+        table.add_row(
+            folder_plan.series_name,
+            folder_plan.status,
+            str(counts["Changed"]),
+            str(counts["Renumbered"]),
+            str(counts["Unchanged"]),
+            str(counts["Skipped"]),
+        )
+    CONSOLE.print(table)
+
+
+def _render_plan_items_table(scan_result: ScanResult, dry_run: bool) -> None:
+    """Render the detailed per-file action table for CLI runs."""
+    table = Table(title="File Actions", box=box.HEAVY_HEAD, show_lines=True)
+    table.add_column("Status", no_wrap=True)
+    table.add_column("Action", no_wrap=True)
+    table.add_column("Original", style="white", overflow="fold")
+    table.add_column("Target", style="cyan", overflow="fold")
+    table.add_column("Folder", style="dim", overflow="fold")
+    table.add_column("Reason", style="white", overflow="fold")
+
+    for item in scan_result.items:
+        status = _effective_plan_status(item, dry_run)
+        target = item.target_name if item.will_rename else "—"
+        table.add_row(
+            _cli_status_badge(status),
+            _cli_action_badge(item.action),
+            item.original_name,
+            target,
+            item.series_name,
+            item.reason or "—",
+        )
+
+    CONSOLE.print(table)
+
+
+def _render_cli_summary(scan_result: ScanResult) -> None:
+    """Render summary metrics for CLI preview/apply runs."""
+    all_items = scan_result.items
+    counts = get_plan_counts(all_items)
+    status_counts = Counter(item.status for item in all_items)
+    metrics = [
+        _cli_metric_panel("Files", str(len(all_items)), "bright_cyan"),
+        _cli_metric_panel("Changed", str(counts["Changed"]), "bright_green"),
+        _cli_metric_panel("Renumbered", str(counts["Renumbered"]), "green"),
+        _cli_metric_panel("Unchanged", str(counts["Unchanged"]), "bright_black"),
+        _cli_metric_panel("Skipped", str(counts["Skipped"]), "yellow"),
+        _cli_metric_panel("Failed", str(status_counts["Failed"]), "red"),
+    ]
+    CONSOLE.print(
+        Panel(
+            Group(*metrics),
+            title="Summary",
+            border_style="bright_blue",
+            box=box.DOUBLE,
+            padding=(0, 1),
+        )
+    )
 
 
 def render_cli_plan(scan_result: ScanResult, dry_run: bool) -> None:
     """Render the CLI preview or applied-results report."""
     all_items = scan_result.items
     if not all_items:
-        CONSOLE.print("[yellow]No files found to process.[/yellow]")
+        CONSOLE.print(
+            Panel(
+                "[bold yellow]No files found to process.[/bold yellow]",
+                border_style="yellow",
+                box=box.ROUNDED,
+            )
+        )
         return
 
-    for folder_plan in scan_result.folder_plans:
-        if dry_run:
-            for item in folder_plan.items:
-                if item.status == "Pending" and item.will_rename:
-                    item.status = "WouldRename"
-        write_folder_summary(folder_plan)
-        for item in folder_plan.items:
-            write_plan_item(item)
-        CONSOLE.print()
-
     counts = get_plan_counts(all_items)
-    failed_count = sum(1 for item in all_items if item.status == "Failed")
-    CONSOLE.rule("Summary")
-    CONSOLE.print(f"Files scanned: {len(all_items)}")
-    CONSOLE.print(f"Files renamed: {counts['Changed']}")
-    CONSOLE.print(f"Files renumbered: {counts['Renumbered']}")
-    CONSOLE.print(f"Files unchanged: {counts['Unchanged']}")
-    CONSOLE.print(f"Files skipped: {counts['Skipped']}")
-    CONSOLE.print(f"Files failed: {failed_count}")
-    write_top_folder_summary(scan_result.folder_plans)
+    if counts["Changed"] == 0 and counts["Skipped"] == 0:
+        CONSOLE.print(
+            Panel(
+                "[bold green]Everything already matches the expected naming scheme.[/bold green]",
+                border_style="green",
+                box=box.ROUNDED,
+            )
+        )
+        _render_cli_summary(scan_result)
+        return
+
+    _render_folder_breakdown(scan_result.folder_plans)
+    _render_plan_items_table(scan_result, dry_run)
+    _render_cli_summary(scan_result)
 
 
 def print_preview_table(scan_result: ScanResult) -> None:
     """Print a compact preview table before detailed per-folder output."""
-    table = Table(title="MKV Rename Preview", show_lines=False)
-    table.add_column("Reason", overflow="fold")
-    table.add_column("Status")
-    table.add_column("Action")
-    table.add_column("Target", overflow="fold")
+    table = Table(title="Rename Preview", box=box.HEAVY_HEAD, show_lines=True)
+    table.add_column("Status", no_wrap=True)
+    table.add_column("Action", no_wrap=True)
     table.add_column("Original", overflow="fold")
+    table.add_column("Target", overflow="fold")
     table.add_column("Folder", overflow="fold")
+    table.add_column("Reason", overflow="fold")
     for item in scan_result.items:
         table.add_row(
-            item.reason,
-            item.status,
-            item.action,
-            item.target_name,
+            _cli_status_badge(item.status),
+            _cli_action_badge(item.action),
             item.original_name,
-            item.folder_path,
+            item.target_name if item.will_rename else "—",
+            item.series_name,
+            item.reason,
         )
     CONSOLE.print(table)
 
@@ -2212,8 +2503,12 @@ def parse_extensions(raw_value: str) -> list[str]:
 
 def confirm_apply() -> bool:
     """Ask the CLI user to confirm that renames should be applied."""
-    answer = input("Apply these rename changes now? [y/N] ").strip().lower()
-    return answer in {"y", "yes"}
+    if not sys.stdin.isatty():
+        return False
+    try:
+        return Confirm.ask("Apply these rename changes now?", default=False)
+    except EOFError:
+        return False
 
 
 def run_cli(args: argparse.Namespace) -> int:
@@ -2232,41 +2527,158 @@ def run_cli(args: argparse.Namespace) -> int:
     renumber_enabled = not args.skip_renumbering
     dry_run = args.dry_run or args.mode == "cli"
 
-    CONSOLE.rule("Anime File Renamer")
-    CONSOLE.print(f"[cyan]Media Path:[/cyan] {media_path}")
-    CONSOLE.print(
-        f"[cyan]Extensions:[/cyan] {', '.join(extensions or list(VIDEO_EXTENSIONS_DEFAULT))}"
-    )
-    CONSOLE.print(f"[cyan]Recursive:[/cyan] {not args.no_recursive}")
-    CONSOLE.print(f"[cyan]Renumbering Enabled:[/cyan] {renumber_enabled}")
-    CONSOLE.print(f"[cyan]Dry-run:[/cyan] {dry_run}")
-    CONSOLE.print()
-
-    scan_result = build_scan_result(
+    recursive = not args.no_recursive
+    file_records = collect_file_records(
         media_path,
-        extensions or list(VIDEO_EXTENSIONS_DEFAULT),
-        recursive=not args.no_recursive,
-        renumber_enabled=renumber_enabled,
+        extensions,
+        recursive=recursive,
     )
-    if not scan_result.items:
-        CONSOLE.print("[yellow]No files found to process.[/yellow]")
+    grouped_records = group_file_records(file_records)
+
+    _render_cli_runtime_header(
+        media_path,
+        extensions,
+        recursive,
+        renumber_enabled,
+        dry_run,
+        args.mode,
+        folder_count=len(grouped_records),
+        file_count=len(file_records),
+    )
+
+    if not file_records:
+        CONSOLE.print(
+            Panel(
+                "[bold yellow]No files found to process.[/bold yellow]",
+                border_style="yellow",
+                box=box.ROUNDED,
+            )
+        )
         return 0
 
-    print_preview_table(scan_result)
-    render_cli_plan(scan_result, dry_run=dry_run)
+    folder_plans: list[FolderPlan] = []
+    scan_progress = _cli_build_operation_progress()
+    scan_task = scan_progress.add_task(
+        "Scanning folders",
+        total=max(1, len(grouped_records)),
+        completed=0,
+        details="queued",
+    )
+    current_panel = _cli_build_current_folder_panel(
+        phase_label="Scanning",
+        folder_index=0,
+        total_folders=len(grouped_records),
+        folder_plan=None,
+        dry_run=dry_run,
+    )
+    live_group = Group(scan_progress, current_panel)
+    with Live(
+        live_group, console=CONSOLE, refresh_per_second=10, transient=False
+    ) as live:
+        for folder_index, (folder_path, records) in enumerate(grouped_records, start=1):
+            folder_plan = validate_folder_plan(
+                new_folder_plan(
+                    folder_path,
+                    records,
+                    renumber_enabled=renumber_enabled,
+                )
+            )
+            folder_plans.append(folder_plan)
+            current_panel = _cli_build_current_folder_panel(
+                phase_label="Scanning",
+                folder_index=folder_index,
+                total_folders=len(grouped_records),
+                folder_plan=folder_plan,
+                dry_run=dry_run,
+            )
+            scan_progress.update(scan_task, details=folder_plan.series_name)
+            live_group = Group(scan_progress, current_panel)
+            live.update(live_group)
+            scan_progress.advance(scan_task)
+
+        scan_progress.update(
+            scan_task,
+            description="Scanned folders",
+            details=f"{len(grouped_records)} folder(s) scanned",
+        )
+        live_group = Group(scan_progress, current_panel)
+        live.update(live_group)
+
+    scan_result = ScanResult(media_path=media_path, folder_plans=folder_plans)
+    _render_cli_summary(scan_result)
 
     if dry_run or args.mode == "cli":
         return 0
     if not args.yes and not confirm_apply():
-        CONSOLE.print("[yellow]Cancelled.[/yellow]")
+        CONSOLE.print(
+            Panel(
+                "[bold yellow]Cancelled. No rename changes were applied.[/bold yellow]",
+                border_style="yellow",
+                box=box.ROUNDED,
+            )
+        )
         return 1
 
-    for folder_plan in scan_result.folder_plans:
-        invoke_two_phase_rename(folder_plan.items)
-        folder_plan.status = get_folder_status_label(folder_plan.items)
+    apply_progress = _cli_build_operation_progress()
+    apply_task = apply_progress.add_task(
+        "Applying folders",
+        total=max(1, len(scan_result.folder_plans)),
+        completed=0,
+        details="queued",
+    )
+    current_panel = _cli_build_current_folder_panel(
+        phase_label="Applying",
+        folder_index=0,
+        total_folders=len(scan_result.folder_plans),
+        folder_plan=None,
+        dry_run=False,
+    )
+    live_group = Group(apply_progress, current_panel)
+    with Live(
+        live_group, console=CONSOLE, refresh_per_second=10, transient=False
+    ) as live:
+        for folder_index, folder_plan in enumerate(scan_result.folder_plans, start=1):
+            current_panel = _cli_build_current_folder_panel(
+                phase_label="Applying",
+                folder_index=folder_index,
+                total_folders=len(scan_result.folder_plans),
+                folder_plan=folder_plan,
+                dry_run=False,
+            )
+            apply_progress.update(apply_task, details=folder_plan.series_name)
+            live_group = Group(apply_progress, current_panel)
+            live.update(live_group)
 
-    CONSOLE.rule("Applied")
-    render_cli_plan(scan_result, dry_run=False)
+            invoke_two_phase_rename(folder_plan.items)
+            folder_plan.status = get_folder_status_label(folder_plan.items)
+
+            current_panel = _cli_build_current_folder_panel(
+                phase_label="Applying",
+                folder_index=folder_index,
+                total_folders=len(scan_result.folder_plans),
+                folder_plan=folder_plan,
+                dry_run=False,
+            )
+            apply_progress.advance(apply_task)
+            live_group = Group(apply_progress, current_panel)
+            live.update(live_group)
+
+        apply_progress.update(
+            apply_task,
+            description="Applied folders",
+            details=f"{len(scan_result.folder_plans)} folder(s) finished",
+        )
+        live_group = Group(apply_progress, current_panel)
+        live.update(live_group)
+
+    CONSOLE.print(
+        Panel(
+            "[bold green]Rename pass finished.[/bold green]",
+            border_style="green",
+            box=box.ROUNDED,
+        )
+    )
+    _render_cli_summary(scan_result)
     return 0
 
 
