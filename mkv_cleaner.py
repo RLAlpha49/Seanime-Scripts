@@ -54,6 +54,21 @@ from operator import attrgetter
 from pathlib import Path
 from typing import TypedDict, cast
 
+from rich import box
+from rich.console import Console, Group, RenderableType
+from rich.live import Live
+from rich.panel import Panel
+from rich.progress import (
+    BarColumn,
+    MofNCompleteColumn,
+    Progress,
+    SpinnerColumn,
+    TaskProgressColumn,
+    TextColumn,
+    TimeElapsedColumn,
+    TimeRemainingColumn,
+)
+from rich.table import Table
 from rich.text import Text
 from textual import work
 from textual.app import App, ComposeResult
@@ -89,6 +104,8 @@ ConfigDict = dict[str, object]
 JsonRichCell = dict[str, str | bool]
 TableCell = str | Text
 InspectorRow = list[TableCell]
+
+CONSOLE = Console()
 
 _SUBPROCESS_PROBE_TIMEOUT_SECONDS = 60.0
 _SUBPROCESS_WRITE_TIMEOUT_SECONDS = 300.0
@@ -4666,44 +4683,362 @@ def _format_track_flags(track: TrackInfo) -> str:
     return f"[{', '.join(flags)}]" if flags else ""
 
 
-def _print_tracks_cli(
-    tracks: list[TrackInfo], mkv_path: Path, file_size: int | None = None
-) -> None:
-    """Print a plain terminal table of tracks for CLI inspect mode."""
-    size_str = f"  ({fmt_size(file_size)})" if file_size is not None else ""
-    print(f"\n{'─' * 62}")
-    print(f"  File : {mkv_path.name}{size_str}")
-    print(f"{'─' * 62}")
-    if not tracks:
-        print("  (no tracks found)")
-        return
+def _cli_build_info_panel(
+    title: str,
+    rows: list[tuple[str, str]],
+    border_style: str,
+) -> Panel:
+    """Build a compact key/value panel for cleaner CLI headers."""
+    grid = Table.grid(padding=(0, 1))
+    grid.add_column(style="bold white", no_wrap=True)
+    grid.add_column(style="white")
+    for label, value in rows:
+        grid.add_row(f"{label}:", value)
+    return Panel(grid, title=title, border_style=border_style, box=box.ROUNDED)
 
-    tag_strings = [_format_track_flags(t) for t in tracks]
-    tag_width = max((len(s) for s in tag_strings), default=0)
-    for t, tag_str in zip(tracks, tag_strings):
-        print(
-            f"  {tag_str:<{tag_width}}  Track {t.tid:>2}  {t.ttype:<12} lang={t.lang:<6}  "
-            f"codec={t.codec:<20}  name={t.name or '—'}"
+
+def _cli_build_metric_panel(
+    title: str,
+    value: str,
+    border_style: str,
+    subtitle: str = "",
+) -> Panel:
+    """Build a metric panel used in CLI summaries and results."""
+    body = Text(justify="center")
+    body.append(f"{value}\n", style=f"bold {border_style}")
+    body.append(subtitle or " ", style="dim")
+    return Panel(body, title=title, border_style=border_style, box=box.ROUNDED)
+
+
+def _cli_build_notice_panel(
+    message: str,
+    border_style: str,
+    *,
+    title: str | None = None,
+) -> Panel:
+    """Build a simple status panel for the current CLI file view."""
+    return Panel(
+        message,
+        title=title,
+        border_style=border_style,
+        box=box.ROUNDED,
+        padding=(0, 1),
+    )
+
+
+def _cli_build_size_result_panel(
+    title: str,
+    before_size: int,
+    after_size: int,
+    *,
+    border_style: str = "green",
+) -> Panel:
+    """Build before/after/saved metrics for one CLI file result."""
+    saved = before_size - after_size
+    grid = Table.grid(expand=True)
+    grid.add_column(ratio=1)
+    grid.add_column(ratio=1)
+    grid.add_column(ratio=1)
+    grid.add_row(
+        _cli_build_metric_panel("Before", fmt_size(before_size), "bright_blue"),
+        _cli_build_metric_panel("After", fmt_size(after_size), "bright_green"),
+        _cli_build_metric_panel("Saved", fmt_delta(saved, before_size), "magenta"),
+    )
+    return Panel(
+        grid,
+        title=title,
+        border_style=border_style,
+        box=box.DOUBLE,
+        padding=(0, 1),
+    )
+
+
+def _cli_build_operation_progress() -> Progress:
+    """Build a dir-sync-style counted progress display for cleaner CLI runs."""
+    return Progress(
+        SpinnerColumn(style="bold cyan", finished_text="✓"),
+        TextColumn("[bold cyan]{task.description}"),
+        BarColumn(
+            bar_width=None,
+            complete_style="bright_magenta",
+            finished_style="magenta",
+        ),
+        TaskProgressColumn(),
+        MofNCompleteColumn(),
+        TextColumn("{task.fields[details]}", style="white"),
+        TimeElapsedColumn(),
+        TimeRemainingColumn(),
+        console=CONSOLE,
+        transient=False,
+        expand=True,
+    )
+
+
+def _cli_build_current_file_panel(
+    *,
+    mode_label: str,
+    current_index: int,
+    total_files: int,
+    file_path: Path | None,
+    blocks: list[RenderableType],
+) -> Panel:
+    """Build the single-file live view shown under the CLI progress bar."""
+    header = Text(style="dim")
+    if file_path is None:
+        header.append(f"{mode_label} 0/{total_files} • waiting for first file")
+    else:
+        header.append(f"{mode_label} {current_index}/{total_files} • ")
+        header.append(file_path.name, style="bold white")
+
+    content: list[RenderableType] = [header]
+    if blocks:
+        content.extend(blocks)
+    else:
+        content.append(
+            _cli_build_notice_panel(
+                "[dim]No file details available yet.[/dim]",
+                "bright_black",
+            )
         )
-    print()
+
+    return Panel(
+        Group(*content),
+        title="[bold white]Current File[/bold white]",
+        border_style="bright_blue",
+        box=box.DOUBLE,
+        padding=(0, 1),
+    )
+
+
+def _cli_render_header(
+    path: Path,
+    *,
+    file_count: int,
+    inspect: bool,
+    dry_run: bool,
+    recursive: bool,
+    in_place: bool,
+    jobs: int,
+    args: argparse.Namespace,
+) -> None:
+    """Render a dir-sync-style header for cleaner CLI runs."""
+    action_tokens: list[str] = []
+    if args.keep_audio:
+        action_tokens.append(f"keep audio={','.join(args.keep_audio)}")
+    if args.keep_subs:
+        action_tokens.append(f"keep subs={','.join(args.keep_subs)}")
+    if _bool_with_default(args.no_subs, False):
+        action_tokens.append("strip subtitles")
+    if args.remove_named:
+        action_tokens.append(f"remove named={','.join(args.remove_named)}")
+    if args.default_audio:
+        action_tokens.append(f"default audio={args.default_audio}")
+    if args.default_subs:
+        action_tokens.append(f"default subs={args.default_subs}")
+    if _bool_with_default(args.sync_title_to_filename, True):
+        action_tokens.append("sync title")
+    actions_text = ", ".join(action_tokens) if action_tokens else "inspect only"
+
+    header_grid = Table.grid(expand=True)
+    header_grid.add_column(ratio=2)
+    header_grid.add_column(ratio=1)
+    header_grid.add_column(ratio=1)
+    header_grid.add_row(
+        _cli_build_info_panel(
+            "Target",
+            [("Path", str(path)), ("Files", str(file_count))],
+            "cyan",
+        ),
+        _cli_build_info_panel(
+            "Run",
+            [
+                ("Mode", "INSPECT" if inspect else "CLEAN"),
+                ("Preview", "Yes" if dry_run else "No"),
+                ("Recursive", "Yes" if recursive else "No"),
+                ("Jobs", str(jobs)),
+            ],
+            "magenta",
+        ),
+        _cli_build_info_panel(
+            "Output",
+            [("In place", "Yes" if in_place else "No"), ("Actions", actions_text)],
+            "green",
+        ),
+    )
+    CONSOLE.print(
+        Panel(
+            header_grid,
+            title="[bold bright_white]MKV Cleaner[/bold bright_white]",
+            border_style="bright_blue",
+            box=box.DOUBLE,
+            padding=(0, 1),
+        )
+    )
+
+
+def _cli_track_flag_text(track: TrackInfo) -> Text:
+    """Render styled flag text for one track row."""
+    flags = _format_track_flags(track)
+    if not flags:
+        return Text("-", style="dim")
+    return Text(flags, style="magenta")
+
+
+def _cli_action_table(
+    summary: RunSummary,
+    *,
+    title_changed: bool,
+    desired_title: str | None,
+    title_skipped: bool,
+) -> Table:
+    """Build the per-file action plan table for cleaner CLI runs."""
+    table = Table(box=box.HEAVY_HEAD, expand=True)
+    table.add_column("Change", no_wrap=True)
+    table.add_column("Track", no_wrap=True)
+    table.add_column("Lang", no_wrap=True)
+    table.add_column("Name", overflow="fold")
+    table.add_column("Details", overflow="fold")
+
+    for track in summary["audio_removed"]:
+        table.add_row(
+            Text("REMOVE AUDIO", style="bold yellow"),
+            str(track.tid),
+            track.lang,
+            track.name or "-",
+            track.codec,
+        )
+    for track in summary["subs_removed"]:
+        table.add_row(
+            Text("REMOVE SUB", style="bold yellow"),
+            str(track.tid),
+            track.lang,
+            track.name or "-",
+            track.codec,
+        )
+
+    audio_defs = summary["audio_defaults"]
+    sub_defs = summary["sub_defaults"]
+    for track in summary["audio_keep"]:
+        if audio_defs.get(track.tid) and not track.default:
+            table.add_row(
+                Text("SET DEFAULT", style="bold magenta"),
+                str(track.tid),
+                track.lang,
+                track.name or "-",
+                "audio",
+            )
+    for track in summary["subs_keep"]:
+        if sub_defs.get(track.tid) and not track.default:
+            table.add_row(
+                Text("SET DEFAULT", style="bold magenta"),
+                str(track.tid),
+                track.lang,
+                track.name or "-",
+                "subtitle",
+            )
+
+    if title_changed:
+        table.add_row(
+            Text("SET TITLE", style="bold cyan"),
+            "-",
+            "-",
+            desired_title or "-",
+            "sync MKV title to output filename",
+        )
+    elif title_skipped:
+        table.add_row(
+            Text("TITLE SKIP", style="bold yellow"),
+            "-",
+            "-",
+            desired_title or "-",
+            "no tracks detected, so title sync is skipped",
+        )
+
+    if table.row_count == 0:
+        table.add_row(
+            Text("NO CHANGES", style="green"),
+            "-",
+            "-",
+            "-",
+            "already matches criteria",
+        )
+    return table
+
+
+def _build_tracks_cli_panel(
+    tracks: list[TrackInfo], mkv_path: Path, file_size: int | None = None
+) -> Panel:
+    """Build a Rich track table panel for CLI inspect/process mode."""
+    title = mkv_path.name
+    if file_size is not None:
+        title = f"{title}  ({fmt_size(file_size)})"
+
+    table = Table(box=box.HEAVY_HEAD, expand=True)
+    table.add_column("Track", justify="right", no_wrap=True)
+    table.add_column("Type", no_wrap=True)
+    table.add_column("Lang", no_wrap=True)
+    table.add_column("Codec", overflow="fold")
+    table.add_column("Name", overflow="fold")
+    table.add_column("Flags", no_wrap=True)
+
+    if not tracks:
+        table.add_row("-", Text("no tracks found", style="yellow"), "-", "-", "-", "-")
+    else:
+        for track in tracks:
+            track_style = {
+                "video": "green",
+                "audio": "yellow",
+                "subtitles": "cyan",
+            }.get(track.ttype, "white")
+            table.add_row(
+                str(track.tid),
+                Text(track.ttype, style=track_style),
+                track.lang,
+                track.codec,
+                track.name or "-",
+                _cli_track_flag_text(track),
+            )
+
+    return Panel(
+        table,
+        title=f"[bold]{title}[/bold]",
+        border_style="bright_blue",
+        box=box.ROUNDED,
+        padding=(0, 1),
+    )
 
 
 def _process_file_cli(
     src: Path,
     options: Mapping[str, object],
+    update_current: Callable[[list[RenderableType]], None] | None = None,
 ) -> FileSummary:
-    """Process one MKV file in non-TUI mode and print progress to stdout."""
+    """Process one MKV file in non-TUI mode and update the current live view."""
     result = FileSummary(path=src)
+
+    def show(*blocks: RenderableType) -> None:
+        renderables = list(blocks)
+        if update_current is not None:
+            update_current(renderables)
+            return
+        for renderable in renderables:
+            CONSOLE.print(renderable)
 
     try:
         tracks, current_title = get_tracks_and_title(src)
     except (RuntimeError, OSError, TypeError, ValueError) as exc:
-        print(f"[SKIP] {src.name} — could not read tracks: {exc}\n")
+        show(
+            _cli_build_notice_panel(
+                f"[bold red]Could not read tracks for {src.name}:[/bold red] {exc}",
+                "red",
+            )
+        )
         result.errored = True
         return result
 
     result.src_size = src.stat().st_size
-    _print_tracks_cli(tracks, src, file_size=result.src_size)
+    tracks_panel = _build_tracks_cli_panel(tracks, src, file_size=result.src_size)
+    show(tracks_panel)
 
     sync_title_to_filename = bool(options.get("sync_title_to_filename", True))
     dry_run = bool(options.get("dry_run", False))
@@ -4729,45 +5064,50 @@ def _process_file_cli(
 
     nothing_removed = not summary["audio_removed"] and not summary["subs_removed"]
     defaults_changed = summary["defaults_changed"]
+    plan_panel = Panel(
+        _cli_action_table(
+            summary,
+            title_changed=title_changed,
+            desired_title=desired_title,
+            title_skipped=title_skipped,
+        ),
+        title=f"[bold]Plan for {src.name}[/bold]",
+        border_style="magenta",
+        box=box.ROUNDED,
+        padding=(0, 1),
+    )
 
     if nothing_removed and not defaults_changed and not title_changed:
-        if title_skipped:
-            print("  ⚠  Skipping title sync because no tracks were detected.")
-        print("  ✓  Nothing to do — file already matches criteria. Skipping.\n")
+        note = (
+            "Skipping title sync because no tracks were detected. "
+            if title_skipped
+            else ""
+        )
+        show(
+            tracks_panel,
+            _cli_build_notice_panel(
+                f"[bold yellow]{note}Nothing to do — file already matches criteria.[/bold yellow]",
+                "yellow",
+            ),
+        )
         result.skipped = True
         return result
 
-    for t in summary["audio_removed"]:
-        print(
-            f"  ✂  Remove audio    : Track {t.tid}  lang={t.lang}  name={t.name or '—'}"
-        )
-    for t in summary["subs_removed"]:
-        print(
-            f"  ✂  Remove subtitle : Track {t.tid}  lang={t.lang}  name={t.name or '—'}"
-        )
-
-    audio_defs = summary["audio_defaults"]
-    sub_defs = summary["sub_defaults"]
-    for t in summary["audio_keep"]:
-        if audio_defs.get(t.tid) and not t.default:
-            print(
-                f"  ★  Set default audio    : Track {t.tid}  lang={t.lang}  name={t.name or '—'}"
-            )
-    for t in summary["subs_keep"]:
-        if sub_defs.get(t.tid) and not t.default:
-            print(
-                f"  ★  Set default subtitle : Track {t.tid}  lang={t.lang}  name={t.name or '—'}"
-            )
-
-    if title_changed:
-        print(f"  ★  Set title          : {desired_title}")
+    show(tracks_panel, plan_panel)
 
     result.removed = [
         ("audio", t.tid, t.lang, t.name) for t in summary["audio_removed"]
     ] + [("subtitle", t.tid, t.lang, t.name) for t in summary["subs_removed"]]
 
     if dry_run:
-        print(f"\n  [DRY RUN] Would write → {dst.name}\n")
+        show(
+            tracks_panel,
+            plan_panel,
+            _cli_build_notice_panel(
+                f"[bold cyan]DRY RUN[/bold cyan] Would write [bold]{dst.name}[/bold]",
+                "cyan",
+            ),
+        )
         return result
 
     metadata_only = nothing_removed and (defaults_changed or title_changed)
@@ -4778,8 +5118,13 @@ def _process_file_cli(
             try:
                 shutil.copy2(src, target)
             except OSError as exc:
-                print(
-                    f"  [ERROR] could not create output file for metadata edit: {exc}\n"
+                show(
+                    tracks_panel,
+                    plan_panel,
+                    _cli_build_notice_panel(
+                        f"[bold red]Could not create output file for metadata edit:[/bold red] {exc}",
+                        "red",
+                    ),
                 )
                 result.errored = True
                 return result
@@ -4791,60 +5136,108 @@ def _process_file_cli(
             title=desired_title if title_changed else None,
         )
         if len(cmd) > 2:
-            print(f"\n  ⚡ Metadata-only update → {target.name} ...")
+            show(
+                tracks_panel,
+                plan_panel,
+                _cli_build_notice_panel(
+                    f"[bold cyan]Metadata-only update[/bold cyan] -> {target.name}",
+                    "cyan",
+                ),
+            )
             try:
                 run = _run_subprocess_with_timeout(
                     cmd,
                     timeout=_SUBPROCESS_WRITE_TIMEOUT_SECONDS,
                 )
             except RuntimeError as exc:
-                print(f"  [ERROR] mkvpropedit failed:\n{exc}\n")
+                show(
+                    tracks_panel,
+                    plan_panel,
+                    _cli_build_notice_panel(
+                        f"[bold red]mkvpropedit failed:[/bold red]\n{exc}",
+                        "red",
+                    ),
+                )
                 result.errored = True
                 return result
             if run.returncode not in (0, 1):
-                print(f"  [ERROR] mkvpropedit failed:\n{run.stderr.strip()}\n")
+                show(
+                    tracks_panel,
+                    plan_panel,
+                    _cli_build_notice_panel(
+                        f"[bold red]mkvpropedit failed:[/bold red]\n{run.stderr.strip()}",
+                        "red",
+                    ),
+                )
                 result.errored = True
                 return result
 
             result.dst_size = target.stat().st_size
-            saved = result.src_size - result.dst_size
-            if in_place:
-                print("  ✅ Done (updated original metadata in-place)")
-            else:
-                print(f"  ✅ Done → {target.name}")
-            print(f"     Before : {fmt_size(result.src_size)}")
-            print(f"     After  : {fmt_size(result.dst_size)}")
-            print(f"     Saved  : {fmt_delta(saved, result.src_size)}\n")
+            show(
+                tracks_panel,
+                plan_panel,
+                _cli_build_size_result_panel(
+                    "[bold green]Updated original metadata in place[/bold green]"
+                    if in_place
+                    else f"[bold green]Wrote {target.name}[/bold green]",
+                    result.src_size,
+                    result.dst_size,
+                ),
+            )
             return result
 
-    print(f"\n  ⏳ Writing → {dst.name} ...")
+    show(
+        tracks_panel,
+        plan_panel,
+        _cli_build_notice_panel(
+            f"[bold cyan]Writing[/bold cyan] -> {dst.name}",
+            "cyan",
+        ),
+    )
     try:
         run = _run_subprocess_with_timeout(
             cmd,
             timeout=_SUBPROCESS_WRITE_TIMEOUT_SECONDS,
         )
     except RuntimeError as exc:
-        print(f"  [ERROR] mkvmerge failed:\n{exc}\n")
+        show(
+            tracks_panel,
+            plan_panel,
+            _cli_build_notice_panel(
+                f"[bold red]mkvmerge failed:[/bold red]\n{exc}",
+                "red",
+            ),
+        )
         result.errored = True
         return result
     if run.returncode not in (0, 1):
-        print(f"  [ERROR] mkvmerge failed:\n{run.stderr.strip()}\n")
+        show(
+            tracks_panel,
+            plan_panel,
+            _cli_build_notice_panel(
+                f"[bold red]mkvmerge failed:[/bold red]\n{run.stderr.strip()}",
+                "red",
+            ),
+        )
         result.errored = True
         return result
 
     result.dst_size = dst.stat().st_size
-    saved = result.src_size - result.dst_size
 
     if in_place:
         src.unlink()
         dst.rename(src)
-        print("  ✅ Done (replaced original)")
-    else:
-        print(f"  ✅ Done → {dst.name}")
-
-    print(f"     Before : {fmt_size(result.src_size)}")
-    print(f"     After  : {fmt_size(result.dst_size)}")
-    print(f"     Saved  : {fmt_delta(saved, result.src_size)}\n")
+    show(
+        tracks_panel,
+        plan_panel,
+        _cli_build_size_result_panel(
+            "[bold green]Replaced original file[/bold green]"
+            if in_place
+            else f"[bold green]Wrote {dst.name}[/bold green]",
+            result.src_size,
+            result.dst_size,
+        ),
+    )
     return result
 
 
@@ -4857,40 +5250,60 @@ def _print_folder_summary_cli(results: list[FileSummary], dry_run: bool) -> None
 
     total_src = sum(r.src_size for r in processed)
     total_dst = sum(r.dst_size for r in processed)
-    total_saved = total_src - total_dst
 
-    print("=" * 62)
-    print("  SUMMARY")
-    print("=" * 62)
-    print(f"  Files found      : {total}")
-    print(f"  Files processed  : {len(processed)}")
-    print(f"  Files skipped    : {len(skipped)}  (already matched criteria)")
-    if errored:
-        print(f"  Files errored    : {len(errored)}")
+    audio_rm = sum(1 for r in results for t in r.removed if t[0] == "audio")
+    sub_rm = sum(1 for r in results for t in r.removed if t[0] == "subtitle")
+
+    metrics = Table.grid(expand=True)
+    metrics.add_column(ratio=1)
+    metrics.add_column(ratio=1)
+    metrics.add_column(ratio=1)
+    metrics.add_row(
+        _cli_build_metric_panel("Files", str(total), "bright_blue", "found"),
+        _cli_build_metric_panel("Processed", str(len(processed)), "bright_cyan"),
+        _cli_build_metric_panel(
+            "Skipped", str(len(skipped)), "yellow", "already matched"
+        ),
+    )
+    metrics.add_row(
+        _cli_build_metric_panel("Errored", str(len(errored)), "red"),
+        _cli_build_metric_panel("Audio Removed", str(audio_rm), "magenta"),
+        _cli_build_metric_panel("Sub Removed", str(sub_rm), "magenta"),
+    )
+    CONSOLE.print(
+        Panel(
+            metrics,
+            title="[bold white]Summary[/bold white]",
+            border_style="bright_blue",
+            box=box.DOUBLE,
+            padding=(0, 1),
+        )
+    )
 
     if processed and not dry_run:
-        print()
-        print(f"  Total before     : {fmt_size(total_src)}")
-        print(f"  Total after      : {fmt_size(total_dst)}")
-        print(f"  Total saved      : {fmt_delta(total_saved, total_src)}")
-
-    all_removed = [r for r in results for _ in r.removed]
-    if all_removed:
-        audio_rm = sum(1 for r in results for t in r.removed if t[0] == "audio")
-        sub_rm = sum(1 for r in results for t in r.removed if t[0] == "subtitle")
-        print()
-        if audio_rm:
-            print(f"  Audio tracks removed    : {audio_rm}")
-        if sub_rm:
-            print(f"  Subtitle tracks removed : {sub_rm}")
+        CONSOLE.print(
+            _cli_build_size_result_panel(
+                "[bold white]Space Impact[/bold white]",
+                total_src,
+                total_dst,
+                border_style="green",
+            )
+        )
 
     if errored:
-        print()
-        print("  Errored files:")
-        for r in errored:
-            print(f"    • {r.path.name}")
-
-    print("=" * 62)
+        error_table = Table(box=box.HEAVY_HEAD, expand=True)
+        error_table.add_column("Errored Files", style="red", overflow="fold")
+        for result in errored:
+            error_table.add_row(result.path.name)
+        CONSOLE.print(
+            Panel(
+                error_table,
+                title="[bold red]Errored Files[/bold red]",
+                border_style="red",
+                box=box.ROUNDED,
+                padding=(0, 1),
+            )
+        )
 
 
 def _bool_with_default(value: bool | None, default: bool) -> bool:
@@ -5038,12 +5451,12 @@ def _build_parser() -> argparse.ArgumentParser:
 def _run_cli_mode(args: argparse.Namespace) -> int:
     """Execute the cleaner in non-interactive CLI mode."""
     if not args.path:
-        print("[ERROR] CLI mode requires a file or folder path.")
+        CONSOLE.print("[red]CLI mode requires a file or folder path.[/red]")
         return 2
 
     path = Path(args.path).expanduser()
     if not path.exists():
-        print(f"[ERROR] Path not found: {path}")
+        CONSOLE.print(f"[red]Path not found:[/red] {path}")
         return 2
 
     check_dependencies()
@@ -5062,42 +5475,106 @@ def _run_cli_mode(args: argparse.Namespace) -> int:
     try:
         files = collect_files(path, recursive)
     except ValueError as exc:
-        print(f"[ERROR] {exc}")
+        CONSOLE.print(f"[red]Error:[/red] {exc}")
         return 2
 
     is_folder = path.is_dir()
 
-    if args.inspect:
-        if is_folder:
-            print(f"\nInspecting {len(files)} file(s) in: {path}")
-            print(f"Using {jobs} parallel worker(s) for metadata inspection.")
-        with ThreadPoolExecutor(max_workers=jobs) as executor:
-            future_map = {
-                executor.submit(get_tracks, file_path): (order_idx, file_path)
-                for order_idx, file_path in enumerate(files)
-            }
-            pending: dict[
-                int, tuple[Path, list[TrackInfo] | None, Exception | None]
-            ] = {}
-            next_emit = 0
-            for future in as_completed(future_map):
-                order_idx, file_path = future_map[future]
-                try:
-                    pending[order_idx] = (file_path, future.result(), None)
-                except (RuntimeError, OSError, TypeError, ValueError) as exc:
-                    pending[order_idx] = (file_path, None, exc)
+    _cli_render_header(
+        path,
+        file_count=len(files),
+        inspect=args.inspect,
+        dry_run=dry_run,
+        recursive=recursive,
+        in_place=in_place,
+        jobs=jobs,
+        args=args,
+    )
 
-                while next_emit in pending:
-                    emit_path, emit_tracks, emit_error = pending.pop(next_emit)
-                    next_emit += 1
-                    if emit_error is not None:
-                        print(f"[SKIP] {emit_path.name} — {emit_error}\n")
-                        continue
-                    _print_tracks_cli(
-                        cast(list[TrackInfo], emit_tracks),
-                        emit_path,
-                        file_size=emit_path.stat().st_size,
-                    )
+    progress = _cli_build_operation_progress()
+
+    if args.inspect:
+        inspect_task = progress.add_task(
+            "Inspecting files",
+            total=max(1, len(files)),
+            completed=0,
+            details="queued",
+        )
+        current_panel = _cli_build_current_file_panel(
+            mode_label="Inspecting",
+            current_index=0,
+            total_files=len(files),
+            file_path=None,
+            blocks=[],
+        )
+        live_group = Group(progress, current_panel)
+        error_count = 0
+
+        with Live(
+            live_group,
+            console=CONSOLE,
+            refresh_per_second=10,
+            transient=False,
+        ) as live:
+            with ThreadPoolExecutor(max_workers=jobs) as executor:
+                future_map = {
+                    executor.submit(get_tracks, file_path): (order_idx, file_path)
+                    for order_idx, file_path in enumerate(files)
+                }
+                pending: dict[
+                    int, tuple[Path, list[TrackInfo] | None, Exception | None]
+                ] = {}
+                next_emit = 0
+                for future in as_completed(future_map):
+                    order_idx, file_path = future_map[future]
+                    try:
+                        pending[order_idx] = (file_path, future.result(), None)
+                    except (RuntimeError, OSError, TypeError, ValueError) as exc:
+                        pending[order_idx] = (file_path, None, exc)
+
+                    while next_emit in pending:
+                        emit_path, emit_tracks, emit_error = pending.pop(next_emit)
+                        next_emit += 1
+                        blocks: list[RenderableType]
+                        if emit_error is not None:
+                            error_count += 1
+                            blocks = [
+                                _cli_build_notice_panel(
+                                    f"[bold yellow]Skipped {emit_path.name}:[/bold yellow] {emit_error}",
+                                    "yellow",
+                                )
+                            ]
+                        else:
+                            blocks = [
+                                _build_tracks_cli_panel(
+                                    cast(list[TrackInfo], emit_tracks),
+                                    emit_path,
+                                    file_size=emit_path.stat().st_size,
+                                )
+                            ]
+                        current_panel = _cli_build_current_file_panel(
+                            mode_label="Inspecting",
+                            current_index=next_emit,
+                            total_files=len(files),
+                            file_path=emit_path,
+                            blocks=blocks,
+                        )
+                        progress.update(inspect_task, details=emit_path.name)
+                        live_group = Group(progress, current_panel)
+                        live.update(live_group)
+                        progress.advance(inspect_task)
+
+            progress.update(
+                inspect_task,
+                description="Inspected files",
+                details=(
+                    f"{len(files)} file(s) scanned"
+                    if error_count == 0
+                    else f"{len(files)} file(s) scanned • errors={error_count}"
+                ),
+            )
+            live_group = Group(progress, current_panel)
+            live.update(live_group)
         return 0
 
     if not any(
@@ -5112,42 +5589,115 @@ def _run_cli_mode(args: argparse.Namespace) -> int:
             sync_title_to_filename,
         ]
     ):
-        print("[ERROR] Nothing to do — specify at least one actionable option:")
-        print("  --keep-audio, --keep-subs, --no-subs, --remove-named,")
-        print("  --default-audio, --default-subs")
+        CONSOLE.print(
+            Panel(
+                "[bold red]Nothing to do.[/bold red] Specify at least one actionable option:\n"
+                "--keep-audio, --keep-subs, --no-subs, --remove-named,\n"
+                "--default-audio, --default-subs",
+                border_style="red",
+                box=box.ROUNDED,
+            )
+        )
         return 2
 
-    print(f"\nFound {len(files)} MKV file(s).")
     if dry_run:
-        print("*** DRY RUN — no files will be written ***")
+        CONSOLE.print(
+            Panel(
+                "[bold yellow]DRY RUN — no files will be written.[/bold yellow]",
+                border_style="yellow",
+                box=box.ROUNDED,
+            )
+        )
 
     results: list[FileSummary] = []
-    for file_path in files:
-        file_options: dict[str, object] = {
-            "keep_audio_langs": args.keep_audio or [],
-            "keep_sub_langs": args.keep_subs or [],
-            "no_subs": no_subs,
-            "remove_named": args.remove_named or [],
-            "auto_default": auto_default,
-            "fix_missing_default": fix_missing_default,
-            "default_audio": args.default_audio,
-            "default_subs": args.default_subs,
-            "sync_title_to_filename": sync_title_to_filename,
-            "protect_single_audio": protect_single_audio,
-            "protect_single_sub": protect_single_sub,
-            "dry_run": dry_run,
-            "in_place": in_place,
-        }
-        result = _process_file_cli(
-            src=file_path,
-            options=file_options,
+    file_options: dict[str, object] = {
+        "keep_audio_langs": args.keep_audio or [],
+        "keep_sub_langs": args.keep_subs or [],
+        "no_subs": no_subs,
+        "remove_named": args.remove_named or [],
+        "auto_default": auto_default,
+        "fix_missing_default": fix_missing_default,
+        "default_audio": args.default_audio,
+        "default_subs": args.default_subs,
+        "sync_title_to_filename": sync_title_to_filename,
+        "protect_single_audio": protect_single_audio,
+        "protect_single_sub": protect_single_sub,
+        "dry_run": dry_run,
+        "in_place": in_place,
+    }
+
+    process_task = progress.add_task(
+        "Processing files",
+        total=max(1, len(files)),
+        completed=0,
+        details="queued",
+    )
+    current_panel = _cli_build_current_file_panel(
+        mode_label="Processing",
+        current_index=0,
+        total_files=len(files),
+        file_path=None,
+        blocks=[],
+    )
+    live_group = Group(progress, current_panel)
+
+    def render_current_file(
+        current_file: Path,
+        current_index: int,
+        blocks: list[RenderableType],
+    ) -> None:
+        nonlocal current_panel, live_group
+        current_panel = _cli_build_current_file_panel(
+            mode_label="Processing",
+            current_index=current_index,
+            total_files=len(files),
+            file_path=current_file,
+            blocks=blocks,
         )
-        results.append(result)
+        live_group = Group(progress, current_panel)
+        live.update(live_group)
+
+    with Live(
+        live_group,
+        console=CONSOLE,
+        refresh_per_second=10,
+        transient=False,
+    ) as live:
+        for file_index, file_path in enumerate(files, start=1):
+            progress.update(process_task, details="")
+
+            update_current = partial(render_current_file, file_path, file_index)
+
+            update_current(
+                [
+                    _cli_build_notice_panel(
+                        "[bold cyan]Preparing file…[/bold cyan]",
+                        "cyan",
+                    )
+                ]
+            )
+            result = _process_file_cli(
+                src=file_path,
+                options=file_options,
+                update_current=update_current,
+            )
+            results.append(result)
+            progress.advance(process_task)
+
+        progress.update(process_task, description="Processed files", details="complete")
+        live_group = Group(progress, current_panel)
+        live.update(live_group)
 
     if is_folder:
         _print_folder_summary_cli(results, dry_run=dry_run)
     else:
-        print("Done.")
+        CONSOLE.print(
+            Panel(
+                "[bold green]Done.[/bold green]",
+                border_style="green",
+                box=box.ROUNDED,
+            )
+        )
 
     return 1 if any(r.errored for r in results) else 0
 
