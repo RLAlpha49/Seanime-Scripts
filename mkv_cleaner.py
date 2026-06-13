@@ -45,7 +45,7 @@ import shutil
 import subprocess
 import threading
 import time
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import Future, ThreadPoolExecutor, as_completed
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
 from datetime import datetime
@@ -4774,6 +4774,111 @@ def _cli_build_operation_progress() -> Progress:
     )
 
 
+def _build_job_file_panel(
+    slot_index: int,
+    file_path: Path | None,
+    status: str,
+    *,
+    detail: str = "",
+    status_style: str = "white",
+) -> Panel:
+    """Build a single job slot panel for parallel CLI processing.
+
+    Always renders File, Status, and Detail rows so the panel height
+    stays consistent and the layout does not shift between updates.
+    """
+    body = Table.grid(expand=True, padding=(0, 1))
+    body.add_column(style="bold cyan", no_wrap=True)
+    body.add_column(style="white", ratio=1)
+    file_label = file_path.name if file_path is not None else "—"
+    body.add_row("File", file_label)
+    body.add_row("Status", Text(status, style=status_style))
+    body.add_row(
+        "Detail", Text(detail, style="dim") if detail else Text("—", style="dim")
+    )
+    border = "bold green" if status_style == "bold green" else "bright_blue"
+    return Panel(
+        body,
+        title=f"[bold white]Job {slot_index}[/bold white]",
+        border_style=border,
+        box=box.ROUNDED,
+        padding=(0, 1),
+    )
+
+
+def _build_job_file_panels(
+    slot_files: list[Path | None],
+    slot_statuses: list[str],
+    *,
+    slot_details: list[str] | None = None,
+    slot_styles: list[str] | None = None,
+) -> list[Panel]:
+    """Build one live panel per worker slot during parallel processing."""
+    details = slot_details or [""] * len(slot_files)
+    styles = slot_styles or ["white"] * len(slot_files)
+    return [
+        _build_job_file_panel(
+            i,
+            fp,
+            status,
+            detail=det,
+            status_style=sty,
+        )
+        for i, (fp, status, det, sty) in enumerate(
+            zip(slot_files, slot_statuses, details, styles), start=1
+        )
+    ]
+
+
+def _build_parallel_result_detail(result: FileSummary) -> tuple[str, str]:
+    """Compute a short detail line and status style from a completed FileSummary.
+
+    Returns ``(detail_text, status_style)`` for the slot panel.
+    """
+    audio_rm = sum(1 for t in result.removed if t[0] == "audio")
+    sub_rm = sum(1 for t in result.removed if t[0] == "subtitle")
+    default_flips = len(result.default_changes)
+
+    if result.errored:
+        parts: list[str] = []
+        if result.src_size:
+            parts.append(fmt_size(result.src_size))
+        return ", ".join(parts) if parts else "", "bold red"
+
+    if result.skipped:
+        return "no changes needed", "bold yellow"
+
+    # Completed successfully — build a concise summary
+    parts = []
+    if audio_rm or sub_rm:
+        rm_parts: list[str] = []
+        if audio_rm:
+            rm_parts.append(f"{audio_rm} audio")
+        if sub_rm:
+            rm_parts.append(f"{sub_rm} sub")
+        parts.append(f"rm: {', '.join(rm_parts)}")
+    if default_flips:
+        parts.append(f"{default_flips} default(s) changed")
+    if result.src_size and result.dst_size:
+        saved = result.src_size - result.dst_size
+        parts.append(f"saved {fmt_delta(saved, result.src_size)}")
+    return " • ".join(parts) if parts else "no changes", "bold green"
+
+
+def _build_job_grid(panels: list[Panel]) -> Table:
+    """Lay out job slot panels in a stable 2-column grid."""
+    columns = 2 if len(panels) > 1 else 1
+    grid = Table.grid(expand=True, padding=(0, 1))
+    for _ in range(columns):
+        grid.add_column(ratio=1)
+    for start in range(0, len(panels), columns):
+        row: list[RenderableType] = list(panels[start : start + columns])
+        while len(row) < columns:
+            row.append(Text(""))
+        grid.add_row(*row)
+    return grid
+
+
 def _cli_build_current_file_panel(
     *,
     mode_label: str,
@@ -5012,11 +5117,20 @@ def _process_file_cli(
     src: Path,
     options: Mapping[str, object],
     update_current: Callable[[list[RenderableType]], None] | None = None,
+    *,
+    _suppress_output: bool = False,
 ) -> FileSummary:
-    """Process one MKV file in non-TUI mode and update the current live view."""
+    """Process one MKV file in non-TUI mode and update the current live view.
+
+    When ``_suppress_output`` is *True* the internal display helpers are
+    silenced so the function can be safely called from worker threads
+    without interfering with the shared Rich *Live* display.
+    """
     result = FileSummary(path=src)
 
     def show(*blocks: RenderableType) -> None:
+        if _suppress_output:
+            return
         renderables = list(blocks)
         if update_current is not None:
             update_current(renderables)
@@ -5381,7 +5495,14 @@ def _build_parser() -> argparse.ArgumentParser:
         "--jobs",
         type=int,
         default=None,
-        help="Parallel workers for inspect metadata reads (default: auto).",
+        help="Number of parallel workers for inspect and processing (default: auto).",
+    )
+    parser.add_argument(
+        "--wait",
+        type=float,
+        default=0.0,
+        help="Seconds to pause after each file result in parallel mode (default: 0). "
+        "Set to 0 to disable. Useful when output scrolls too fast to read.",
     )
 
     _add_bool_toggle(
@@ -5626,67 +5747,239 @@ def _run_cli_mode(args: argparse.Namespace) -> int:
         "in_place": in_place,
     }
 
+    use_parallel = jobs > 1 and len(files) > 1
+    display_delay = args.wait
+
     process_task = progress.add_task(
         "Processing files",
         total=max(1, len(files)),
         completed=0,
         details="queued",
     )
-    current_panel = _cli_build_current_file_panel(
-        mode_label="Processing",
-        current_index=0,
-        total_files=len(files),
-        file_path=None,
-        blocks=[],
-    )
-    live_group = Group(progress, current_panel)
 
-    def render_current_file(
-        current_file: Path,
-        current_index: int,
-        blocks: list[RenderableType],
-    ) -> None:
-        nonlocal current_panel, live_group
-        current_panel = _cli_build_current_file_panel(
-            mode_label="Processing",
-            current_index=current_index,
-            total_files=len(files),
-            file_path=current_file,
-            blocks=blocks,
+    if use_parallel:
+        # ── Parallel processing with per-job slot panels ──────────────────
+        slot_count = min(jobs, len(files))
+        slot_files: list[Path | None] = [None] * slot_count
+        slot_statuses: list[str] = ["Waiting for work." for _ in range(slot_count)]
+        slot_details: list[str] = [""] * slot_count
+        slot_styles: list[str] = ["white"] * slot_count
+        pending_iter = iter(files)
+        future_to_slot: dict[Future[FileSummary], int] = {}
+
+        current_panel: RenderableType = _cli_build_notice_panel(
+            f"[dim]Starting {slot_count} parallel worker(s)…[/dim]",
+            "bright_black",
         )
         live_group = Group(progress, current_panel)
-        live.update(live_group)
 
-    with Live(
-        live_group,
-        console=CONSOLE,
-        refresh_per_second=10,
-        transient=False,
-    ) as live:
-        for file_index, file_path in enumerate(files, start=1):
-            progress.update(process_task, details="")
+        with Live(
+            live_group,
+            console=CONSOLE,
+            refresh_per_second=10,
+            transient=False,
+        ) as live:
 
-            update_current = partial(render_current_file, file_path, file_index)
+            def _render_job_panels() -> None:
+                """Render the current per-job panel grid."""
+                nonlocal live_group
+                panels = _build_job_file_panels(
+                    slot_files,
+                    slot_statuses,
+                    slot_details=slot_details,
+                    slot_styles=slot_styles,
+                )
+                grid = _build_job_grid(panels)
+                live_group = Group(progress, grid)
+                live.update(live_group)
 
-            update_current(
-                [
-                    _cli_build_notice_panel(
-                        "[bold cyan]Preparing file…[/bold cyan]",
-                        "cyan",
-                    )
-                ]
-            )
-            result = _process_file_cli(
-                src=file_path,
-                options=file_options,
-                update_current=update_current,
-            )
-            results.append(result)
-            progress.advance(process_task)
+            def _submit_next(slot: int) -> bool:
+                """Submit the next file for one slot, if any remain."""
+                try:
+                    file_path = next(pending_iter)
+                except StopIteration:
+                    slot_files[slot] = None
+                    slot_statuses[slot] = "Completed — no more files."
+                    slot_details[slot] = ""
+                    slot_styles[slot] = "white"
+                    _render_job_panels()
+                    return False
 
-        progress.update(process_task, description="Processed files", details="complete")
+                slot_files[slot] = file_path
+                slot_statuses[slot] = "Processing…"
+                slot_details[slot] = ""
+                slot_styles[slot] = "cyan"
+                _render_job_panels()
+
+                future = executor.submit(
+                    _process_file_cli,
+                    file_path,
+                    file_options,
+                    None,
+                    _suppress_output=True,
+                )
+                future_to_slot[future] = slot
+                return True
+
+            # Per-slot resume time: when a slot becomes idle its resume
+            # time is set to ``now + display_delay``.  The main loop only
+            # hands new work to slots whose resume time has passed, so
+            # every slot is independent and other slots can still finish
+            # and show results while one slot is in its post-result wait.
+            slot_resume_at: list[float] = [0.0] * slot_count
+            slot_busy: list[bool] = [False] * slot_count
+            total_submitted = 0
+
+            def _try_submit_idle() -> None:
+                """Give work to every idle slot whose delay has elapsed."""
+                nonlocal total_submitted
+                now = time.monotonic()
+                for slot in range(slot_count):
+                    if slot_busy[slot]:
+                        continue
+                    if now < slot_resume_at[slot]:
+                        continue
+                    if _submit_next(slot):
+                        slot_busy[slot] = True
+                        total_submitted += 1
+
+            with ThreadPoolExecutor(max_workers=jobs) as executor:
+                _render_job_panels()
+                # Submit the initial batch (one file per slot).
+                for slot in range(slot_count):
+                    if _submit_next(slot):
+                        slot_busy[slot] = True
+                        total_submitted += 1
+
+                while total_submitted < len(files):
+                    # Before waiting for futures, give work to any
+                    # idle slots whose delay has already elapsed.
+                    _try_submit_idle()
+
+                    # Collect futures that are still in-flight.
+                    pending_futures = [f for f in future_to_slot.keys()]
+                    if not pending_futures:
+                        # All submitted work finished but some slots
+                        # are still in their delay window.  Spin until
+                        # the next slot becomes eligible.
+                        time.sleep(0.05)
+                        continue
+
+                    # Wait for at least one future to complete, with a
+                    # short poll interval so we can check for newly-
+                    # eligible idle slots even when no futures finish
+                    # right away.
+                    try:
+                        done_futures = list(as_completed(pending_futures, timeout=0.2))
+                    except TimeoutError:
+                        done_futures = []
+
+                    for completed_future in done_futures:
+                        slot = future_to_slot.pop(completed_future)
+                        slot_busy[slot] = False
+                        try:
+                            result: FileSummary = completed_future.result()
+                        except Exception:
+                            slot_path = slot_files[slot]
+                            result = FileSummary(
+                                path=slot_path
+                                if slot_path is not None
+                                else Path("<unknown>"),
+                                errored=True,
+                            )
+
+                        results.append(result)
+                        progress.advance(process_task)
+
+                        # Compute rich status from the result
+                        detail_text, status_style = _build_parallel_result_detail(
+                            result
+                        )
+                        if result.errored:
+                            slot_statuses[slot] = "Error."
+                        elif result.skipped:
+                            slot_statuses[slot] = "Skipped — no changes."
+                        else:
+                            slot_statuses[slot] = (
+                                f"Done. ({fmt_size(result.src_size)} → "
+                                f"{fmt_size(result.dst_size)})"
+                            )
+                        slot_details[slot] = detail_text
+                        slot_styles[slot] = status_style
+                        _render_job_panels()
+
+                        # Mark when this slot can pick up new work.
+                        slot_resume_at[slot] = time.monotonic() + display_delay
+
+                    # Give newly-eligible slots work immediately.
+                    _try_submit_idle()
+
+        progress.update(
+            process_task,
+            description="Processed files",
+            details="complete",
+        )
+    else:
+        # ── Sequential processing (single worker) ─────────────────────────
+        current_panel = _cli_build_current_file_panel(
+            mode_label="Processing",
+            current_index=0,
+            total_files=len(files),
+            file_path=None,
+            blocks=[],
+        )
         live_group = Group(progress, current_panel)
-        live.update(live_group)
+
+        def render_current_file(
+            current_file: Path,
+            current_index: int,
+            blocks: list[RenderableType],
+        ) -> None:
+            nonlocal current_panel, live_group
+            current_panel = _cli_build_current_file_panel(
+                mode_label="Processing",
+                current_index=current_index,
+                total_files=len(files),
+                file_path=current_file,
+                blocks=blocks,
+            )
+            live_group = Group(progress, current_panel)
+            live.update(live_group)
+
+        with Live(
+            live_group,
+            console=CONSOLE,
+            refresh_per_second=10,
+            transient=False,
+        ) as live:
+            for file_index, file_path in enumerate(files, start=1):
+                progress.update(process_task, details="")
+
+                update_current = partial(render_current_file, file_path, file_index)
+
+                update_current(
+                    [
+                        _cli_build_notice_panel(
+                            "[bold cyan]Preparing file…[/bold cyan]",
+                            "cyan",
+                        )
+                    ]
+                )
+                result = _process_file_cli(
+                    src=file_path,
+                    options=file_options,
+                    update_current=update_current,
+                )
+                results.append(result)
+                progress.advance(process_task)
+
+            progress.update(
+                process_task,
+                description="Processed files",
+                details="complete",
+            )
+            live_group = Group(progress, current_panel)
+            live.update(live_group)
 
     if is_folder:
         _print_folder_summary_cli(results, dry_run=dry_run)
