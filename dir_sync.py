@@ -511,17 +511,6 @@ def inventory_stats_text(
     )
 
 
-def compare_stats_text(plan: PlanResult) -> str:
-    """Render stable compare-phase counters."""
-    return (
-        f"compared={format_count(plan.compared_file_pairs)} "
-        f"metadata={format_count(plan.metadata_equal_pairs)} "
-        f"cache={format_count(plan.cached_equal_pairs)} "
-        f"hashed={format_count(plan.hashed_file_pairs)} "
-        f"actions={format_count(len(plan.actions))}"
-    )
-
-
 def apply_stats_text(
     removed_files: int,
     removed_dirs: int,
@@ -1367,8 +1356,6 @@ def render_plan(
                 box=box.ROUNDED,
             )
         )
-        if plan.mode != "rebuild":
-            CONSOLE.print(compare_stats_text(plan))
         return
 
     legend_text = Text()
