@@ -1319,6 +1319,52 @@ def _cli_build_folder_items_table(folder_plan: FolderPlan, dry_run: bool) -> Tab
     return table
 
 
+def _cli_build_scanning_folder_panel(
+    *,
+    phase_label: str,
+    folder_index: int,
+    total_folders: int,
+    folder_plan: FolderPlan | None,
+    dry_run: bool,
+) -> Panel:
+    """Build a compact current-folder panel for the scanning phase."""
+    header = Text(style="dim")
+    if folder_plan is None:
+        header.append(f"{phase_label} 0/{total_folders} • waiting for first folder")
+        body: list[RenderableType] = [
+            header,
+            _cli_build_notice_panel(
+                "[dim]No folder details available yet.[/dim]",
+                "bright_black",
+            ),
+        ]
+    else:
+        header.append(f"{phase_label} {folder_index}/{total_folders} • ")
+        header.append(folder_plan.series_name, style="bold white")
+        header.append(f"  ({folder_plan.status})", style="bold magenta")
+        counts = _cli_display_counts(folder_plan, dry_run)
+        changed = counts["Changed"] + counts["Renumbered"]
+        unchanged = counts["Unchanged"]
+        skipped = counts["Skipped"]
+        parts: list[str] = []
+        if changed:
+            parts.append(f"[bright_green]{changed} will change[/bright_green]")
+        if unchanged:
+            parts.append(f"[bright_black]{unchanged} unchanged[/bright_black]")
+        if skipped:
+            parts.append(f"[yellow]{skipped} skipped[/yellow]")
+        summary = " • ".join(parts) if parts else "[dim]—[/dim]"
+        body = [header, Text.from_markup(summary, style="white")]
+
+    return Panel(
+        Group(*body),
+        title="[bold white]Scanning[/bold white]",
+        border_style="bright_cyan",
+        box=box.ROUNDED,
+        padding=(0, 1),
+    )
+
+
 def _cli_build_current_folder_panel(
     *,
     phase_label: str,
@@ -1466,19 +1512,25 @@ def _render_plan_items_table(scan_result: ScanResult, dry_run: bool) -> None:
     CONSOLE.print(table)
 
 
-def _render_cli_summary(scan_result: ScanResult) -> None:
+def _render_cli_summary(scan_result: ScanResult, *, folder_count: int = 0) -> None:
     """Render summary metrics for CLI preview/apply runs."""
     all_items = scan_result.items
     counts = get_plan_counts(all_items)
     status_counts = Counter(item.status for item in all_items)
-    metrics = [
+    metrics: list[RenderableType] = [
         _cli_metric_panel("Files", str(len(all_items)), "bright_cyan"),
+    ]
+    if folder_count:
+        metrics.append(
+            _cli_metric_panel("Folders", str(folder_count), "bright_blue"),
+        )
+    metrics.extend([
         _cli_metric_panel("Changed", str(counts["Changed"]), "bright_green"),
         _cli_metric_panel("Renumbered", str(counts["Renumbered"]), "green"),
         _cli_metric_panel("Unchanged", str(counts["Unchanged"]), "bright_black"),
         _cli_metric_panel("Skipped", str(counts["Skipped"]), "yellow"),
         _cli_metric_panel("Failed", str(status_counts["Failed"]), "red"),
-    ]
+    ])
     CONSOLE.print(
         Panel(
             Group(*metrics),
@@ -2757,7 +2809,7 @@ def run_cli(args: argparse.Namespace) -> int:
         completed=0,
         details="queued",
     )
-    current_panel = _cli_build_current_folder_panel(
+    current_panel = _cli_build_scanning_folder_panel(
         phase_label="Scanning",
         folder_index=0,
         total_folders=len(grouped_records),
@@ -2777,7 +2829,7 @@ def run_cli(args: argparse.Namespace) -> int:
                 )
             )
             folder_plans.append(folder_plan)
-            current_panel = _cli_build_current_folder_panel(
+            current_panel = _cli_build_scanning_folder_panel(
                 phase_label="Scanning",
                 folder_index=folder_index,
                 total_folders=len(grouped_records),
@@ -2797,8 +2849,16 @@ def run_cli(args: argparse.Namespace) -> int:
         live_group = Group(scan_progress, current_panel)
         live.update(live_group)
 
+    CONSOLE.print(
+        _cli_build_notice_panel(
+            f"[bold green]Scanning complete[/bold green]  —  "
+            f"{len(file_records)} file(s) across {len(grouped_records)} folder(s)",
+            "green",
+            title="Scanned",
+        )
+    )
+
     scan_result = ScanResult(media_path=media_path, folder_plans=folder_plans)
-    _render_cli_summary(scan_result)
 
     if dry_run or args.mode == "cli":
         return 0
@@ -2871,7 +2931,7 @@ def run_cli(args: argparse.Namespace) -> int:
             box=box.ROUNDED,
         )
     )
-    _render_cli_summary(scan_result)
+    _render_cli_summary(scan_result, folder_count=len(scan_result.folder_plans))
     return 0
 
 
