@@ -121,18 +121,27 @@ EPISODE_PATTERNS = {
     "SpecialEpisode": re.compile(
         (
             r"(?:^|[-\s])(?P<Label>OVA|OAD|SP|SPECIAL|NCOP|NCED|OP|ED|PV)"
-            r"\s*(?P<Number>\d{0,3})(?:v\d+)?$"
+            r"\s*(?P<Number>\d{0,3})(?:v\d+)?(?:\s|$)"
         ),
         re.I,
     ),
     "BracketEpisode": re.compile(
         r"\[\s*(?P<Episode>\d{1,3}(?:\.\d+)?)\s*(?:v\d+)?\s*\]", re.I
     ),
+    "ParentheticalEpisode": re.compile(
+        r"\(\s*(?P<Episode>\d{1,3}(?:\.\d+)?)\s*\)", re.I
+    ),
     "EpisodeTitle": re.compile(
         r"(?:^|[-\s])(?P<Episode>\d{1,3}(?:\.\d+)?)\s*(?:v\d+)?\s*[-–]\s*\S", re.I
     ),
+    "StandaloneEpisode": re.compile(
+        r"^(?P<Episode>\d{1,3}(?:\.\d+)?)$", re.I
+    ),
     "BareEpisode": re.compile(
-        r"(?:^|[-\s])(?P<Episode>\d{1,3}(?:\.\d+)?)(?:v\d+)?(?:\s|$)", re.I
+        r"[-–]\s*(?P<Episode>\d{1,3}(?:\.\d+)?)(?:v\d+)?(?:\s|$)", re.I
+    ),
+    "CompactEpisode": re.compile(
+        r"(?<=[a-zA-Z])-(?P<Episode>\d{1,3}(?:\.\d+)?)(?:v\d+)?$", re.I
     ),
 }
 
@@ -575,7 +584,16 @@ def get_episode_info(filename: str) -> EpisodeInfo | None:
             float(episode),
             match.group(0),
         )
-    if match := EPISODE_PATTERNS["EpisodeTitle"].search(working_name):
+    if match := EPISODE_PATTERNS["ParentheticalEpisode"].search(working_name):
+        episode = match.group("Episode")
+        return EpisodeInfo(
+            "NumericEpisode",
+            new_numeric_episode_token(episode),
+            2,
+            float(episode),
+            match.group(0),
+        )
+    if match := EPISODE_PATTERNS["StandaloneEpisode"].search(working_name):
         episode = match.group("Episode")
         return EpisodeInfo(
             "NumericEpisode",
@@ -585,6 +603,24 @@ def get_episode_info(filename: str) -> EpisodeInfo | None:
             match.group(0),
         )
     if match := EPISODE_PATTERNS["BareEpisode"].search(working_name):
+        episode = match.group("Episode")
+        return EpisodeInfo(
+            "NumericEpisode",
+            new_numeric_episode_token(episode),
+            2,
+            float(episode),
+            match.group(0),
+        )
+    if match := EPISODE_PATTERNS["CompactEpisode"].search(working_name):
+        episode = match.group("Episode")
+        return EpisodeInfo(
+            "NumericEpisode",
+            new_numeric_episode_token(episode),
+            2,
+            float(episode),
+            match.group(0),
+        )
+    if match := EPISODE_PATTERNS["EpisodeTitle"].search(working_name):
         episode = match.group("Episode")
         return EpisodeInfo(
             "NumericEpisode",
