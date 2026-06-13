@@ -728,8 +728,8 @@ def new_folder_plan(
     sorted_files = sorted(
         file_records,
         key=lambda record: (
-            record.episode_info.sort_group if record.episode_info else 9,
             record.episode_info.sort_value if record.episode_info else float("inf"),
+            record.episode_info.sort_group if record.episode_info else 9,
             record.file.name.lower(),
         ),
     )
