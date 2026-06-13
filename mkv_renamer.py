@@ -116,7 +116,7 @@ EPISODE_PATTERNS = {
         re.I,
     ),
     "ExplicitEpisode": re.compile(
-        r"(?:^|[-\s])(?:E|EP|Episode)\s*(?P<Episode>\d{1,3}(?:\.\d+)?)(?:v\d+)?$", re.I
+        r"(?:^|[-\s])(?:E|EP|Episode)\s*(?P<Episode>\d{1,3}(?:\.\d+)?)(?:v\d+)?(?:\s|$)", re.I
     ),
     "SpecialEpisode": re.compile(
         (
@@ -125,8 +125,14 @@ EPISODE_PATTERNS = {
         ),
         re.I,
     ),
+    "BracketEpisode": re.compile(
+        r"\[\s*(?P<Episode>\d{1,3}(?:\.\d+)?)\s*(?:v\d+)?\s*\]", re.I
+    ),
+    "EpisodeTitle": re.compile(
+        r"(?:^|[-\s])(?P<Episode>\d{1,3}(?:\.\d+)?)\s*(?:v\d+)?\s*[-–]\s*\S", re.I
+    ),
     "BareEpisode": re.compile(
-        r"(?:^|[-\s])(?P<Episode>\d{1,3}(?:\.\d+)?)(?:v\d+)?$", re.I
+        r"(?:^|[-\s])(?P<Episode>\d{1,3}(?:\.\d+)?)(?:v\d+)?(?:\s|$)", re.I
     ),
 }
 
@@ -467,10 +473,17 @@ def remove_leading_release_tags(value: str) -> str:
 
 
 def remove_trailing_release_tags(value: str) -> str:
-    """Remove release-group tags from the end of a name fragment."""
+    """Remove release-group tags from the end of a name fragment.
+
+    Tags that look like episode numbers (e.g. ``[01]``, ``[10v2]``) are
+    preserved so downstream pattern matching can detect them.
+    """
     result = value.strip()
     pattern = re.compile(r"\s*(\[[^\]]+\]|\([^\)]+\)|\{[^\}]+\})\s*$")
+    episode_bracket = re.compile(r"\[\s*\d{1,3}(?:\s*v\s*\d+)?\s*\]$")
     while True:
+        if episode_bracket.search(result):
+            break
         updated = pattern.sub("", result).strip()
         if updated == result:
             break
@@ -551,6 +564,24 @@ def get_episode_info(filename: str) -> EpisodeInfo | None:
             new_special_episode_token(match.group("Label"), number_value),
             3,
             float(sort_number),
+            match.group(0),
+        )
+    if match := EPISODE_PATTERNS["BracketEpisode"].search(working_name):
+        episode = match.group("Episode")
+        return EpisodeInfo(
+            "NumericEpisode",
+            new_numeric_episode_token(episode),
+            2,
+            float(episode),
+            match.group(0),
+        )
+    if match := EPISODE_PATTERNS["EpisodeTitle"].search(working_name):
+        episode = match.group("Episode")
+        return EpisodeInfo(
+            "NumericEpisode",
+            new_numeric_episode_token(episode),
+            2,
+            float(episode),
             match.group(0),
         )
     if match := EPISODE_PATTERNS["BareEpisode"].search(working_name):
