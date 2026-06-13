@@ -107,17 +107,84 @@ PlanAction = Literal["Movie", "Skip", "Format", "Renumber"]
 
 _APPLYABLE_STATUSES = {"Pending", "WouldRename"}
 
+# ---------------------------------------------------------------------------
+# Episode-pattern registry
+#
+# Each pattern extracts an episode number (or special label + number) from a
+# *cleaned* filename stem (release tags stripped, dots/underscores replaced
+# with spaces, whitespace normalised).
+#
+# Patterns are tried in strict precedence order in ``get_episode_info``.
+# The first match wins, so the most-specific patterns come first.
+#
+# All numeric patterns capture into a named group ``Episode`` so the calling
+# code can build a normalised token (e.g. ``E01``, ``E10``).
+#
+# Below each pattern you'll find a short doc-string explaining what it
+# catches together with concrete examples.
+# ---------------------------------------------------------------------------
+
 EPISODE_PATTERNS = {
+    # SeasonEpisode --------------------------------------------------------
+    # Matches the classic ``S01E01`` / ``S04E10`` / ``S12E01`` format used
+    # by many release groups and media managers.
+    #
+    # The ``Season`` capture is 1-2 digits; the ``Episode`` capture is 1-3
+    # digits (with optional decimal, e.g.  ``E01.5``) and an optional
+    # version tag (``v2``).
+    #
+    # Examples:  "Show S01E01 1080p"       → S01, E01
+    #            "Show S04E10 1080p"       → S04, E10
+    #            "Show S01E01v2 1080p"     → S01, E01 (versioned)
+    #            "Show S01E01E02"          → S01, E01 (double; first wins)
+    #            "Show S01E01.5 1080p"     → S01, E01.5 (fractional)
+    # ---------------------------------------------------------------------------
     "SeasonEpisode": re.compile(
-        r"\bS(?P<Season>\d{1,2})E(?P<Episode>\d{1,3}(?:\.\d+)?)(?:v\d+)?\b", re.I
-    ),
-    "LeadingEpisode": re.compile(
-        r"^(?:E|EP|Episode)\s*(?P<Episode>\d{1,3}(?:\.\d+)?)(?:v\d+)?(?:\b|[-\s_])",
+        r"\bS(?P<Season>\d{1,2})E(?P<Episode>\d{1,3}(?:\.\d+)?)(?:v\d+)?\b",
         re.I,
     ),
-    "ExplicitEpisode": re.compile(
-        r"(?:^|[-\s])(?:E|EP|Episode)\s*(?P<Episode>\d{1,3}(?:\.\d+)?)(?:v\d+)?(?:\s|$)", re.I
+    # LeadingEpisode -------------------------------------------------------
+    # Matches when the episode indicator (``E``, ``EP``, ``Episode``) is the
+    # *very first thing* in the cleaned name.  Trailing ``\b`` or a
+    # separator ensures we don't eat the episode number if another word
+    # immediately follows.
+    #
+    # Examples:  "E01 Title"       → E01
+    #            "EP05"            → E05
+    #            "Episode_10"      → E10
+    # ---------------------------------------------------------------------------
+    "LeadingEpisode": re.compile(
+        r"^(?:E|EP|Episode)\s*(?P<Episode>\d{1,3}(?:\.\d+)?)"
+        r"(?:v\d+)?(?:\b|[-\s_])",
+        re.I,
     ),
+    # ExplicitEpisode ------------------------------------------------------
+    # Matches ``E01``, ``EP10``, ``Episode 03`` when they appear somewhere in
+    # the *middle or end* of the name (not at the very start — that's
+    # LeadingEpisode's job).  The match is anchored on the right by ``\s``
+    # or end-of-string so it doesn't accidentally grab a trailing number
+    # from a tag.
+    #
+    # Examples:  "Show E01 1080p"     → E01
+    #            "Show EP10 Title"    → E10
+    #            "Show Episode 03"    → E03
+    # ---------------------------------------------------------------------------
+    "ExplicitEpisode": re.compile(
+        r"(?:^|[-\s])(?:E|EP|Episode)\s*(?P<Episode>\d{1,3}(?:\.\d+)?)"
+        r"(?:v\d+)?(?:\s|$)",
+        re.I,
+    ),
+    # SpecialEpisode -------------------------------------------------------
+    # Matches common anime special labels: OVA, OAD, SP, SPECIAL, NCOP,
+    # NCED, OP, ED, PV — optionally followed by a 0-3 digit number.
+    # No trailing ``$`` anchor so that trailing episode titles or codec
+    # tags don't prevent detection.
+    #
+    # Examples:  "Show SP01 Title"     → SP01
+    #            "Show OVA02"          → OVA02
+    #            "Show NCOP01"         → NCOP01
+    #            "Show Special"        → SPECIAL (no number)
+    # ---------------------------------------------------------------------------
     "SpecialEpisode": re.compile(
         (
             r"(?:^|[-\s])(?P<Label>OVA|OAD|SP|SPECIAL|NCOP|NCED|OP|ED|PV)"
@@ -125,21 +192,80 @@ EPISODE_PATTERNS = {
         ),
         re.I,
     ),
+    # BracketEpisode -------------------------------------------------------
+    # Matches episode numbers enclosed in square brackets, e.g. ``[01]``,
+    # ``[10]``, ``[01v2]``.  The trailing-release-tag removal preserves
+    # these so the pattern can pick them up.
+    #
+    # Examples:  "Show [01] [1080p]"    → E01
+    #            "Show [10v2] [1080p]"  → E10 (versioned)
+    #            "Show [01]"            → E01
+    # ---------------------------------------------------------------------------
     "BracketEpisode": re.compile(
         r"\[\s*(?P<Episode>\d{1,3}(?:\.\d+)?)\s*(?:v\d+)?\s*\]", re.I
     ),
+    # ParentheticalEpisode -------------------------------------------------
+    # Matches episode numbers in parentheses, e.g. ``(01)``, ``(10)``.
+    # Note: leading ``(`` tags are stripped during tag removal, but
+    # parenthesised numbers that remain in the middle of the name are
+    # caught here.
+    #
+    # Examples:  "Show (01) 1080p"     → E01
+    #            "Show (10) 1080p"     → E10
+    # ---------------------------------------------------------------------------
     "ParentheticalEpisode": re.compile(
         r"\(\s*(?P<Episode>\d{1,3}(?:\.\d+)?)\s*\)", re.I
     ),
+    # EpisodeTitle ---------------------------------------------------------
+    # Matches a bare number followed by `` - Title`` (em-dash supported).
+    # This catches the common ``Show - 01 - Episode Title`` format.
+    # Placed *after* BareEpisode in priority so that simpler patterns win
+    # when both could match.
+    #
+    # Examples:  "Show - 01 - Title"      → E01
+    #            "Show - 10 – Tenth Ep"   → E10
+    # ---------------------------------------------------------------------------
     "EpisodeTitle": re.compile(
-        r"(?:^|[-\s])(?P<Episode>\d{1,3}(?:\.\d+)?)\s*(?:v\d+)?\s*[-–]\s*\S", re.I
+        r"(?:^|[-\s])(?P<Episode>\d{1,3}(?:\.\d+)?)\s*(?:v\d+)?\s*[-–]\s*\S",
+        re.I,
     ),
-    "StandaloneEpisode": re.compile(
-        r"^(?P<Episode>\d{1,3}(?:\.\d+)?)$", re.I
-    ),
+    # StandaloneEpisode ----------------------------------------------------
+    # Matches filenames that are *entirely* a number (after cleaning), e.g.
+    # ``01.mkv``, ``10.mkv``.  Prevents false-positive matching of series
+    # name numbers when used as a last-resort anchor.
+    #
+    # Examples:  "01"        → E01
+    #            "10"        → E10
+    #            "100"       → E100
+    # ---------------------------------------------------------------------------
+    "StandaloneEpisode": re.compile(r"^(?P<Episode>\d{1,3}(?:\.\d+)?)(?:v\d+)?$", re.I),
+    # BareEpisode ----------------------------------------------------------
+    # Matches a number preceded by a dash (``-`` or en-dash ``–``) and
+    # followed by whitespace or end-of-string.  This is the main workhorse
+    # for the ``Show - 01`` and ``Show – 10`` style.
+    #
+    # The prefix is *only* a dash — plain whitespace is not sufficient —
+    # to avoid matching series-name-internal numbers like ``86`` or ``00``.
+    #
+    # Examples:  "Show - 01"              → E01
+    #            "Show - 10 1080p"        → E10
+    #            "Show – 23 Title"        → E23
+    #            "86 - 01"                → E01  (series "86", episode 01)
+    #            "Gundam 00 - 01"         → E01  (series "Gundam 00", ep 01)
+    # ---------------------------------------------------------------------------
     "BareEpisode": re.compile(
         r"[-–]\s*(?P<Episode>\d{1,3}(?:\.\d+)?)(?:v\d+)?(?:\s|$)", re.I
     ),
+    # CompactEpisode -------------------------------------------------------
+    # Matches ``Show-01`` where the episode number directly follows a letter
+    # with a dash separator and no surrounding spaces (common in dot-replaced
+    # filenames).  The lookbehind ``(?<=[a-zA-Z])`` ensures the dash follows
+    # a word character, avoiding false positives on numbers in resolution
+    # strings.
+    #
+    # Examples:  "Show-01"     → E01
+    #            "Show-10"     → E10
+    # ---------------------------------------------------------------------------
     "CompactEpisode": re.compile(
         r"(?<=[a-zA-Z])-(?P<Episode>\d{1,3}(?:\.\d+)?)(?:v\d+)?$", re.I
     ),
