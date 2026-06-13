@@ -5914,6 +5914,53 @@ def _run_cli_mode(args: argparse.Namespace) -> int:
                     # Give newly-eligible slots work immediately.
                     _try_submit_idle()
 
+                # Drain remaining in-flight futures after all files
+                # have been submitted.  Without this loop the progress
+                # bar could reach 100 % while jobs are still running.
+                for completed_future in as_completed(
+                    list(future_to_slot.keys())
+                ):
+                    slot = future_to_slot.pop(completed_future)
+                    slot_busy[slot] = False
+                    try:
+                        result: FileSummary = completed_future.result()
+                    except Exception:
+                        slot_path = slot_files[slot]
+                        result = FileSummary(
+                            path=slot_path
+                            if slot_path is not None
+                            else Path("<unknown>"),
+                            errored=True,
+                        )
+
+                    results.append(result)
+                    progress.advance(process_task)
+
+                    detail_text, status_style = (
+                        _build_parallel_result_detail(result)
+                    )
+                    if result.errored:
+                        slot_statuses[slot] = "Error."
+                    elif result.skipped:
+                        slot_statuses[slot] = "Skipped — no changes."
+                    else:
+                        slot_statuses[slot] = (
+                            f"Done. ({fmt_size(result.src_size)} → "
+                            f"{fmt_size(result.dst_size)})"
+                        )
+                    slot_details[slot] = detail_text
+                    slot_styles[slot] = status_style
+                    _render_job_panels()
+
+                # Mark every slot as done so the final panels show
+                # a uniform "Completed — no more files." state.
+                for slot in range(slot_count):
+                    slot_files[slot] = None
+                    slot_statuses[slot] = "Completed — no more files."
+                    slot_details[slot] = ""
+                    slot_styles[slot] = "white"
+                _render_job_panels()
+
         progress.update(
             process_task,
             description="Processed files",
